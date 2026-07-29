@@ -43,22 +43,27 @@ const state = {
   previewGeneration: 0,
   confirmResolve: null,
   cacheLoadGeneration: 0,
+  cacheLoaded: false,
+  cacheLoading: false,
+  cacheStale: false,
+  cacheLimit: null,
+  settingsLoaded: false,
+  settingsLoading: false,
+  settingsCacheLimit: null,
   updateCheck: null,
   updateCheckAttempted: false,
   updateChecking: false,
   updateApplying: false,
+  updateStatusLoading: false,
   updateActive: false,
   updatePhase: "idle",
   updateTargetVersion: "",
   updateExpectedJobId: "",
   updateLastStatusJobId: "",
-  updateRecoveryBaselineJobId: "",
-  updateRecoveryStartedAt: 0,
-  updatePollGeneration: 0,
-  updatePollTimer: null,
-  updateTransientSince: 0,
-  updateObservedActive: false,
-  updateReloadScheduled: false,
+  updateSubmissionUnconfirmed: false,
+  updateSubmissionBaselineJobId: "",
+  updateSubmissionTargetVersion: "",
+  updateReloadAvailable: false,
 };
 
 function byId(id) {
@@ -179,29 +184,35 @@ function updateCanApply(check) {
 
 function renderUpdateControls() {
   const checkButton = byId("check-update");
+  const statusButton = byId("refresh-update-status");
   const applyButton = byId("apply-update");
+  const reloadButton = byId("reload-console");
   checkButton.textContent = state.updateChecking
     ? "检查中…"
     : state.updateCheckAttempted
       ? "再次检查"
       : "检查更新";
-  checkButton.disabled = state.updateChecking || state.updateApplying || state.updateActive;
+  checkButton.disabled =
+    state.updateChecking
+    || state.updateApplying
+    || state.updateStatusLoading
+    || state.updateActive;
+  statusButton.textContent = state.updateStatusLoading
+    ? "读取状态中…"
+    : "刷新更新状态";
+  statusButton.disabled =
+    state.updateChecking || state.updateApplying || state.updateStatusLoading;
 
-  const showCompletedButton =
-    state.updatePhase === "succeeded" && state.updateReloadScheduled;
   const showApplyButton =
     state.updateActive
     || state.updateApplying
-    || Boolean(state.updateCheck)
-    || showCompletedButton;
+    || Boolean(state.updateCheck);
   applyButton.hidden = !showApplyButton;
 
-  if (showCompletedButton) {
-    applyButton.textContent = "更新完成，正在刷新…";
-  } else if (state.updateApplying) {
-    applyButton.textContent = "正在更新…";
+  if (state.updateApplying) {
+    applyButton.textContent = "正在提交更新…";
   } else if (state.updateActive) {
-    applyButton.textContent = "正在更新…";
+    applyButton.textContent = "更新已受理";
   } else {
     applyButton.textContent = state.updateTargetVersion
       ? `更新到 ${state.updateTargetVersion}`
@@ -210,8 +221,8 @@ function renderUpdateControls() {
   applyButton.disabled =
     state.updateApplying
     || state.updateActive
-    || showCompletedButton
     || !updateCanApply(state.updateCheck);
+  reloadButton.hidden = !state.updateReloadAvailable;
 }
 
 function updateStatusMessage(phase, payload) {
@@ -228,51 +239,42 @@ function updateStatusMessage(phase, payload) {
   return serverMessage;
 }
 
-function scheduleUpdateReload() {
-  if (state.updateReloadScheduled) {
-    return;
-  }
-  state.updateReloadScheduled = true;
-  renderUpdateControls();
-  window.setTimeout(() => {
-    window.location.reload();
-  }, 1200);
-}
-
-function renderUpdateJob(result, { observed = false } = {}) {
+function renderUpdateJob(result) {
   const payload = normalizeUpdatePayload(result);
   const phase = updatePhaseOf(payload);
-  state.updateLastStatusJobId = textValue(payload.job_id);
+  const jobId = textValue(payload.job_id);
+  if (
+    state.updateExpectedJobId
+    && jobId
+    && state.updateExpectedJobId !== jobId
+  ) {
+    throw new Error("返回的更新状态不属于当前已受理任务。");
+  }
+  state.updateLastStatusJobId = jobId;
   updateCurrentVersion(payload);
   if (textValue(payload.target_version ?? payload.latest_version)) {
     showReleaseDetails(payload);
   }
   state.updatePhase = phase;
+  state.updateReloadAvailable = phase === "succeeded";
 
   if (activeUpdatePhases.has(phase)) {
     state.updateActive = true;
-    state.updateObservedActive = true;
-    state.updateTransientSince = 0;
-    setUpdateJobNote("");
+    setUpdateJobNote("页面不会自动刷新状态；请稍后再次点击“刷新更新状态”。");
     setUpdateMessage(updateStatusMessage(phase, payload));
     renderUpdateControls();
     return true;
   }
 
   state.updateActive = false;
+  state.updateExpectedJobId = "";
   if (phase === "succeeded") {
     const message = textValue(payload.message, "上次更新已成功完成。");
-    if (observed || state.updateObservedActive) {
-      setUpdateJobNote("");
-      setUpdateMessage("更新完成，正在刷新…", "success");
-      scheduleUpdateReload();
-    } else {
-      setUpdateJobNote(message, "success");
-    }
+    state.updateCheck = null;
+    setUpdateMessage("更新已完成。", "success");
+    setUpdateJobNote(`${message} 请点击“刷新控制台”载入新版本。`, "success");
   } else if (phase === "failed") {
-    if (observed || state.updateObservedActive) {
-      setUpdateMessage("更新失败。", "error");
-    }
+    setUpdateMessage("更新失败。", "error");
     setUpdateJobNote(
       textValue(
         payload.message,
@@ -281,9 +283,7 @@ function renderUpdateJob(result, { observed = false } = {}) {
       "error",
     );
   } else if (phase === "interrupted") {
-    if (observed || state.updateObservedActive) {
-      setUpdateMessage("更新已中断。", "error");
-    }
+    setUpdateMessage("更新已中断。", "error");
     setUpdateJobNote(
       textValue(
         payload.message,
@@ -293,117 +293,57 @@ function renderUpdateJob(result, { observed = false } = {}) {
     );
   } else if (terminalUpdatePhases.has(phase)) {
     setUpdateJobNote(textValue(payload.message, "更新任务已结束。"));
+  } else {
+    setUpdateMessage(
+      textValue(payload.message, "当前没有进行中的更新任务。"),
+    );
+    setUpdateJobNote("");
   }
   renderUpdateControls();
   return false;
 }
 
-function stopUpdatePolling() {
-  state.updatePollGeneration += 1;
-  state.updateTransientSince = 0;
-  if (state.updatePollTimer !== null) {
-    window.clearTimeout(state.updatePollTimer);
-    state.updatePollTimer = null;
+async function refreshUpdateStatus() {
+  if (state.updateStatusLoading || state.updateApplying) {
+    return;
   }
-}
-
-function startUpdatePolling({
-  checkAfterRecovery = false,
-  requireNewJob = false,
-} = {}) {
-  stopUpdatePolling();
-  const generation = state.updatePollGeneration;
-
-  const poll = async () => {
-    if (generation !== state.updatePollGeneration) {
-      return;
-    }
-    if (!state.updateTransientSince) {
-      state.updateTransientSince = Date.now();
-    }
-    const remainingWatchdog = Math.max(
-      0,
-      90_000 - (Date.now() - state.updateTransientSince),
-    );
-    const requestWatchdog = window.setTimeout(() => {
-      if (generation === state.updatePollGeneration) {
-        setUpdateMessage(
-          "暂时无法确认更新结果，请稍后重新打开控制台检查。",
-        );
-      }
-    }, remainingWatchdog);
-    try {
-      const result = await bridge.apiGet("update/status");
-      if (generation !== state.updatePollGeneration) {
-        return;
-      }
-      const payload = normalizeUpdatePayload(result);
-      const phase = updatePhaseOf(payload);
+  state.updateStatusLoading = true;
+  setUpdateMessage("正在读取更新状态…");
+  renderUpdateControls();
+  try {
+    const result = await bridge.apiGet("update/status");
+    const payload = normalizeUpdatePayload(result);
+    if (state.updateSubmissionUnconfirmed) {
       const jobId = textValue(payload.job_id);
-      if (state.updateExpectedJobId) {
-        if (jobId !== state.updateExpectedJobId) {
-          throw new Error("返回的更新任务与已受理任务不一致。");
-        }
-      } else if (requireNewJob) {
-        if (!jobId || jobId === state.updateRecoveryBaselineJobId) {
-          if (
-            state.updateRecoveryStartedAt
-            && Date.now() - state.updateRecoveryStartedAt < 30_000
-          ) {
-            throw new Error("更新任务尚未出现在状态接口中。");
-          }
-          stopUpdatePolling();
-          state.updateActive = false;
-          state.updateObservedActive = false;
-          state.updatePhase = "idle";
-          setUpdateMessage(
-            "未确认到新的更新任务，正在重新检查版本…",
-          );
-          renderUpdateControls();
-          if (checkAfterRecovery) {
-            await checkForUpdates(false);
-          }
-          return;
-        }
-        state.updateExpectedJobId = jobId;
-        state.updateRecoveryStartedAt = 0;
-      }
-      state.updateTransientSince = 0;
-      const stillActive = renderUpdateJob(payload, {
-        observed:
-          Boolean(state.updateExpectedJobId)
-          || activeUpdatePhases.has(phase),
-      });
-      if (!stillActive) {
-        state.updateExpectedJobId = "";
-        state.updateRecoveryStartedAt = 0;
-        stopUpdatePolling();
-        if (checkAfterRecovery && !state.updateReloadScheduled) {
-          await checkForUpdates(false);
-        }
-        return;
-      }
-    } catch (error) {
-      if (generation !== state.updatePollGeneration) {
-        return;
-      }
-      if (!state.updateTransientSince) {
-        state.updateTransientSince = Date.now();
-      }
-      if (Date.now() - state.updateTransientSince >= 90_000) {
-        setUpdateMessage(
-          "暂时无法确认更新结果，请稍后重新打开控制台检查。",
+      const targetVersion = textValue(payload.target_version);
+      const isNewJob =
+        Boolean(jobId) && jobId !== state.updateSubmissionBaselineJobId;
+      const isExpectedTarget =
+        Boolean(targetVersion)
+        && targetVersion === state.updateSubmissionTargetVersion;
+      if (!isNewJob || !isExpectedTarget) {
+        updateCurrentVersion(payload);
+        setUpdateMessage("暂时没有确认到本次更新任务。");
+        setUpdateJobNote(
+          "状态接口返回的是上一次记录或其他任务；请稍后再次手动刷新，暂勿重复提交更新。",
+          "error",
         );
+        renderUpdateControls();
+        return;
       }
-    } finally {
-      window.clearTimeout(requestWatchdog);
+      state.updateSubmissionUnconfirmed = false;
+      state.updateExpectedJobId = jobId;
+      state.updateSubmissionBaselineJobId = "";
+      state.updateSubmissionTargetVersion = "";
     }
-    if (generation === state.updatePollGeneration) {
-      state.updatePollTimer = window.setTimeout(poll, 2000);
-    }
-  };
-
-  state.updatePollTimer = window.setTimeout(poll, 2000);
+    renderUpdateJob(payload);
+  } catch (error) {
+    setUpdateMessage(messageOf(error), "error");
+    setUpdateJobNote("未自动重试；请稍后手动刷新更新状态。");
+  } finally {
+    state.updateStatusLoading = false;
+    renderUpdateControls();
+  }
 }
 
 function checkResultMessage(status, payload) {
@@ -438,6 +378,9 @@ async function checkForUpdates(force = false) {
   }
   state.updateChecking = true;
   state.updateCheckAttempted = true;
+  state.updateCheck = null;
+  state.updateTargetVersion = "";
+  byId("update-release").hidden = true;
   setUpdateMessage("正在检查更新…");
   renderUpdateControls();
   try {
@@ -445,9 +388,6 @@ async function checkForUpdates(force = false) {
     const payload = normalizeUpdatePayload(result);
     const status = updatePhaseOf(payload);
     updateCurrentVersion(payload);
-    state.updateCheck = null;
-    state.updateTargetVersion = "";
-
     if (status === "update_available") {
       showReleaseDetails(payload);
       const canApply = updateCanApply(payload);
@@ -506,10 +446,49 @@ async function applyAvailableUpdate() {
   }
 
   state.updateApplying = true;
-  const recoveryBaselineJobId = state.updateLastStatusJobId;
+  state.updateReloadAvailable = false;
   setUpdateJobNote("");
+  setUpdateMessage("正在确认当前更新状态…");
+  renderUpdateControls();
+
+  let baselinePayload;
+  try {
+    baselinePayload = normalizeUpdatePayload(
+      await withTimeout(
+        bridge.apiGet("update/status"),
+        10_000,
+        "读取当前更新状态超时。",
+      ),
+    );
+  } catch (error) {
+    state.updateApplying = false;
+    setUpdateMessage(messageOf(error), "error");
+    setUpdateJobNote(
+      "尚未提交更新；请先手动刷新更新状态，确认没有其他任务后再试。",
+      "error",
+    );
+    renderUpdateControls();
+    return;
+  }
+
+  const baselinePhase = updatePhaseOf(baselinePayload);
+  if (activeUpdatePhases.has(baselinePhase)) {
+    state.updateApplying = false;
+    renderUpdateJob(baselinePayload);
+    setUpdateJobNote(
+      "检测到已有更新任务；请稍后手动刷新状态，不要重复提交。",
+    );
+    renderUpdateControls();
+    return;
+  }
+
+  state.updateLastStatusJobId = textValue(baselinePayload.job_id);
+  state.updateSubmissionBaselineJobId = state.updateLastStatusJobId;
+  state.updateSubmissionTargetVersion = targetVersion;
+  state.updateSubmissionUnconfirmed = false;
   setUpdateMessage("正在提交更新任务…");
   renderUpdateControls();
+
   try {
     const result = await withTimeout(
       bridge.apiPost("update/apply", {
@@ -525,10 +504,9 @@ async function applyAvailableUpdate() {
     state.updateCheck = null;
     state.updateApplying = false;
     state.updateActive = true;
-    state.updateObservedActive = true;
     state.updateExpectedJobId = textValue(payload.job_id);
-    state.updateRecoveryBaselineJobId = "";
-    state.updateRecoveryStartedAt = 0;
+    state.updateSubmissionBaselineJobId = "";
+    state.updateSubmissionTargetVersion = "";
     state.updatePhase = updatePhaseOf(payload) || "accepted";
     if (!activeUpdatePhases.has(state.updatePhase)) {
       state.updatePhase = "accepted";
@@ -538,47 +516,22 @@ async function applyAvailableUpdate() {
       state.updateTargetVersion,
     );
     setUpdateMessage(updateStatusMessage(state.updatePhase, payload));
+    setUpdateJobNote("更新已在后台受理；请稍后手动刷新更新状态。");
     renderUpdateControls();
-    startUpdatePolling();
   } catch (error) {
     state.updateApplying = false;
     state.updateCheck = null;
     state.updateActive = true;
-    state.updateObservedActive = false;
     state.updateExpectedJobId = "";
-    state.updateRecoveryBaselineJobId = recoveryBaselineJobId;
-    state.updateRecoveryStartedAt = Date.now();
+    state.updateSubmissionUnconfirmed = true;
     state.updatePhase = "accepted";
-    setUpdateMessage(`${messageOf(error)} 正在确认更新任务状态…`, "error");
+    setUpdateMessage(messageOf(error), "error");
+    setUpdateJobNote(
+      "无法自动确认任务是否已受理；请手动刷新更新状态，避免重复提交。",
+      "error",
+    );
     renderUpdateControls();
-    startUpdatePolling({
-      checkAfterRecovery: true,
-      requireNewJob: true,
-    });
   }
-}
-
-async function initializeUpdates() {
-  let active = false;
-  try {
-    const result = await bridge.apiGet("update/status");
-    active = renderUpdateJob(result);
-  } catch (error) {
-    state.updateActive = true;
-    state.updateObservedActive = false;
-    state.updateExpectedJobId = "";
-    state.updateRecoveryBaselineJobId = "";
-    state.updateRecoveryStartedAt = 0;
-    setUpdateJobNote("");
-    setUpdateMessage("控制台暂时无法读取更新状态，正在尝试恢复连接…");
-    startUpdatePolling({ checkAfterRecovery: true });
-    return;
-  }
-  if (active) {
-    startUpdatePolling();
-    return;
-  }
-  await checkForUpdates(false);
 }
 
 function setButtonBusy(button, busy, busyText) {
@@ -592,6 +545,12 @@ function setButtonBusy(button, busy, busyText) {
     delete button.dataset.originalText;
   }
   button.disabled = busy;
+}
+
+function renderSettingsControls() {
+  byId("save-settings").disabled =
+    !state.settingsLoaded || state.settingsLoading;
+  byId("reload-settings").disabled = state.settingsLoading;
 }
 
 function applySettings(settings) {
@@ -631,37 +590,79 @@ function syncCompressionState() {
 }
 
 async function loadSettings() {
+  if (state.settingsLoading) {
+    return;
+  }
+  state.settingsLoading = true;
+  const reload = byId("reload-settings");
+  setButtonBusy(reload, true, "读取中…");
+  renderSettingsControls();
   setInlineMessage("正在读取…");
   try {
     const settings = await bridge.apiGet("settings");
     applySettings(settings);
+    updateCurrentVersion(settings);
+    const cacheLimit = Number(settings.cache_max_images);
+    state.settingsCacheLimit = Number.isFinite(cacheLimit) ? cacheLimit : null;
+    state.settingsLoaded = true;
     setInlineMessage("");
   } catch (error) {
+    state.settingsLoaded = false;
     setInlineMessage(messageOf(error), "error");
+  } finally {
+    state.settingsLoading = false;
+    setButtonBusy(reload, false);
+    renderSettingsControls();
   }
 }
 
 async function saveSettings(event) {
   event.preventDefault();
+  if (!state.settingsLoaded || state.settingsLoading) {
+    setInlineMessage("请先成功读取设置，再进行保存。", "error");
+    return;
+  }
   const form = byId("settings-form");
   if (!form.reportValidity()) {
     return;
   }
+  const submitted = collectSettings();
+  const previousCacheLimit = state.settingsCacheLimit;
   const button = byId("save-settings");
   setButtonBusy(button, true, "保存中…");
   setInlineMessage("");
   try {
-    const result = await bridge.apiPost("settings", collectSettings());
+    const result = await bridge.apiPost("settings", submitted);
+    const savedSettings =
+      result && result.settings && typeof result.settings === "object"
+        ? result.settings
+        : submitted;
     if (result && result.settings) {
       applySettings(result.settings);
     }
+    const savedCacheLimit = Number(savedSettings.cache_max_images);
+    state.settingsCacheLimit = Number.isFinite(savedCacheLimit)
+      ? savedCacheLimit
+      : previousCacheLimit;
     const evicted = Number(result && result.evicted);
-    setInlineMessage(evicted > 0 ? `设置已保存，并淘汰 ${evicted} 张旧图。` : "设置已保存。", "success");
-    await loadCache();
+    setInlineMessage(
+      evicted > 0
+        ? `设置已保存，并淘汰 ${evicted} 张旧图。`
+        : "设置已保存。",
+      "success",
+    );
+    if (
+      previousCacheLimit !== null
+      && state.settingsCacheLimit !== null
+      && previousCacheLimit !== state.settingsCacheLimit
+    ) {
+      markCacheStale();
+    }
   } catch (error) {
     setInlineMessage(messageOf(error), "error");
   } finally {
     setButtonBusy(button, false);
+    renderSettingsControls();
   }
 }
 
@@ -673,9 +674,6 @@ function activateTab(panelId) {
   }
   for (const panel of document.querySelectorAll(".tab-panel")) {
     panel.hidden = panel.id !== panelId;
-  }
-  if (panelId === "cache-panel") {
-    loadCache();
   }
 }
 
@@ -720,6 +718,44 @@ function labelValue(label, value) {
 function itemFilename(item) {
   const extension = item.format === "jpeg" ? "jpg" : item.format || "bin";
   return `canvasforge-${item.id}.${extension}`;
+}
+
+function renderCacheSummary() {
+  const summary = byId("cache-summary");
+  if (state.cacheStale) {
+    summary.textContent = "缓存设置已变化，当前列表可能已过期；请手动刷新。";
+    return;
+  }
+  if (!state.cacheLoaded) {
+    summary.textContent = "尚未读取缓存。";
+    return;
+  }
+  summary.textContent =
+    state.cacheLimit === 0
+      ? `共 ${state.items.length} 张；当前已停止新增缓存。`
+      : `共 ${state.items.length} 张，最多保留 ${Number.isFinite(state.cacheLimit) ? state.cacheLimit : 3} 张。`;
+}
+
+function renderCacheControls() {
+  byId("clear-cache").disabled =
+    state.cacheLoading
+    || !state.cacheLoaded
+    || state.cacheStale
+    || state.items.length === 0;
+}
+
+function markCacheStale() {
+  if (!state.cacheLoaded && !state.cacheStale) {
+    return;
+  }
+  state.cacheLoaded = false;
+  state.cacheStale = true;
+  if (state.observer) {
+    state.observer.disconnect();
+  }
+  renderCacheSummary();
+  renderCacheControls();
+  setCacheMessage("缓存列表不会自动重载；请点击“刷新缓存”读取最新内容。");
 }
 
 function createCard(item) {
@@ -847,9 +883,14 @@ async function loadThumbnail(image) {
 }
 
 async function loadCache() {
+  if (state.cacheLoading) {
+    return;
+  }
   const generation = ++state.cacheLoadGeneration;
   const refresh = byId("refresh-cache");
+  state.cacheLoading = true;
   setButtonBusy(refresh, true, "读取中…");
+  renderCacheControls();
   setCacheMessage("");
   try {
     const result = await bridge.apiGet("cache");
@@ -858,10 +899,10 @@ async function loadCache() {
     }
     state.items = Array.isArray(result.items) ? result.items : [];
     const limit = Number(result.limit);
-    byId("cache-summary").textContent =
-      limit === 0
-        ? `共 ${state.items.length} 张；当前已停止新增缓存。`
-        : `共 ${state.items.length} 张，最多保留 ${Number.isFinite(limit) ? limit : 3} 张。`;
+    state.cacheLimit = Number.isFinite(limit) ? limit : null;
+    state.cacheLoaded = true;
+    state.cacheStale = false;
+    renderCacheSummary();
     renderGallery();
   } catch (error) {
     if (generation === state.cacheLoadGeneration) {
@@ -869,14 +910,18 @@ async function loadCache() {
     }
   } finally {
     if (generation === state.cacheLoadGeneration) {
+      state.cacheLoading = false;
       setButtonBusy(refresh, false);
+      renderCacheControls();
     }
   }
 }
 
 function invalidateCacheLoads() {
   state.cacheLoadGeneration += 1;
+  state.cacheLoading = false;
   setButtonBusy(byId("refresh-cache"), false);
+  renderCacheControls();
 }
 
 async function openPreview(item) {
@@ -994,7 +1039,8 @@ async function deleteItem(item, button) {
     }
     state.items = state.items.filter((candidate) => candidate.id !== item.id);
     renderGallery();
-    byId("cache-summary").textContent = `共 ${state.items.length} 张缓存图片。`;
+    renderCacheSummary();
+    renderCacheControls();
     setCacheMessage("缓存图片已删除。", "success");
   } catch (error) {
     setCacheMessage(messageOf(error), "error");
@@ -1003,6 +1049,10 @@ async function deleteItem(item, button) {
 }
 
 async function clearCache() {
+  if (!state.cacheLoaded || state.cacheStale) {
+    setCacheMessage("请先手动刷新缓存列表，再执行清空。", "error");
+    return;
+  }
   if (state.items.length === 0) {
     setCacheMessage("当前没有可清空的图片。");
     return;
@@ -1026,12 +1076,13 @@ async function clearCache() {
     closePreview();
     state.items = [];
     renderGallery();
-    byId("cache-summary").textContent = "共 0 张缓存图片。";
+    renderCacheSummary();
     setCacheMessage(`已清空 ${Number(result.removed) || 0} 张图片。`, "success");
   } catch (error) {
     setCacheMessage(messageOf(error), "error");
   } finally {
     setButtonBusy(button, false);
+    renderCacheControls();
   }
 }
 
@@ -1042,8 +1093,13 @@ function wireEvents() {
   byId("check-update").addEventListener("click", () => {
     checkForUpdates(true);
   });
+  byId("refresh-update-status").addEventListener("click", refreshUpdateStatus);
   byId("apply-update").addEventListener("click", applyAvailableUpdate);
+  byId("reload-console").addEventListener("click", () => {
+    window.location.reload();
+  });
   byId("settings-form").addEventListener("submit", saveSettings);
+  byId("reload-settings").addEventListener("click", loadSettings);
   byId("output_format").addEventListener("change", syncCompressionState);
   byId("refresh-cache").addEventListener("click", loadCache);
   byId("clear-cache").addEventListener("click", clearCache);
@@ -1073,18 +1129,21 @@ function wireEvents() {
       resolveConfirmation(false);
     }
   });
-  window.addEventListener("pagehide", stopUpdatePolling, { once: true });
 }
 
 async function initialize() {
   wireEvents();
+  renderUpdateControls();
+  renderSettingsControls();
+  renderCacheSummary();
+  renderCacheControls();
   if (!bridge) {
     setInlineMessage("AstrBot Page bridge 不可用。", "error");
     return;
   }
   try {
     await bridge.ready();
-    await Promise.all([loadSettings(), loadCache(), initializeUpdates()]);
+    await loadSettings();
   } catch (error) {
     setInlineMessage(messageOf(error), "error");
   }

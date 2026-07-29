@@ -148,6 +148,7 @@ class WebAPI:
         begin_mutation: Callable[[], bool | Awaitable[bool]],
         end_mutation: Callable[[], Any | Awaitable[Any]],
         update_coordinator: UpdateCoordinator,
+        plugin_version: str,
     ) -> None:
         self._context = context
         self._cache = cache_store
@@ -156,6 +157,7 @@ class WebAPI:
         self._begin_mutation_callback = begin_mutation
         self._end_mutation_callback = end_mutation
         self._updates = update_coordinator
+        self._plugin_version = str(plugin_version)
         self._settings_save_lock = asyncio.Lock()
         self._registered = False
         self._active = True
@@ -346,7 +348,9 @@ class WebAPI:
             return unauthorized
         try:
             current = await self._call(self._get_settings_callback)
-            return json_response(normalize_settings(current))
+            payload = normalize_settings(current)
+            payload["plugin_version"] = self._plugin_version
+            return json_response(payload)
         except Exception:
             return error_response("无法读取生成设置", status_code=500)
 

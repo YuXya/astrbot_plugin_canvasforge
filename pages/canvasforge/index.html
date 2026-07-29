@@ -24,11 +24,11 @@
               </div>
               <span class="version-badge">
                 当前
-                <strong id="current-version">读取中…</strong>
+                <strong id="current-version">尚未读取</strong>
               </span>
             </div>
             <p id="update-status" class="update-status" role="status" aria-live="polite">
-              正在检查更新…
+              尚未检查更新。
             </p>
             <p id="update-job-note" class="update-job-note" role="status" aria-live="polite" hidden></p>
             <dl id="update-release" class="update-release" hidden>
@@ -46,9 +46,15 @@
               </div>
             </dl>
             <div class="update-actions">
+              <button id="refresh-update-status" class="button subtle" type="button">
+                刷新更新状态
+              </button>
               <button id="check-update" class="button subtle" type="button">检查更新</button>
               <button id="apply-update" class="button primary" type="button" hidden>
                 安装更新
+              </button>
+              <button id="reload-console" class="button primary" type="button" hidden>
+                刷新控制台
               </button>
             </div>
           </section>
@@ -191,7 +197,8 @@
           </details>
 
           <div class="form-actions">
-            <button id="save-settings" class="button primary" type="submit">保存设置</button>
+            <button id="reload-settings" class="button subtle" type="button">重新读取设置</button>
+            <button id="save-settings" class="button primary" type="submit" disabled>保存设置</button>
             <span id="settings-message" class="inline-message" role="status" aria-live="polite"></span>
           </div>
         </form>
@@ -201,11 +208,11 @@
         <div class="panel-heading cache-heading">
           <div>
             <h2>图片缓存</h2>
-            <p id="cache-summary">正在读取缓存…</p>
+            <p id="cache-summary">尚未读取缓存。</p>
           </div>
           <div class="toolbar">
-            <button id="refresh-cache" class="button subtle" type="button">刷新</button>
-            <button id="clear-cache" class="button danger" type="button">清空全部</button>
+            <button id="refresh-cache" class="button subtle" type="button">刷新缓存</button>
+            <button id="clear-cache" class="button danger" type="button" disabled>清空全部</button>
           </div>
         </div>
 

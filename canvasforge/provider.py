@@ -468,6 +468,29 @@ def _extract_generated_image(
     return _validate_generated_image(decoded)
 
 
+def _process_response_body(
+    body: bytes,
+    status: int,
+    max_output_bytes: int,
+) -> GeneratedImage:
+    """Parse, classify, decode, and validate one complete upstream response.
+
+    This function is deliberately synchronous so callers can run all
+    CPU-intensive response processing in a single worker-thread handoff.
+    """
+
+    if status < 200 or status >= 300:
+        if status >= 400:
+            payload = _parse_json(body, status)
+            raise _classified_upstream_error(status, payload)
+        raise CanvasForgeError(ErrorCode.BAD_RESPONSE)
+
+    payload = _parse_json(body, status)
+    if _payload_has_error(payload):
+        raise _classified_upstream_error(status, payload)
+    return _extract_generated_image(payload, max_output_bytes)
+
+
 class Sub2APIImagesProvider:
     """Non-streaming OpenAI Images-compatible provider backed by Sub2API."""
 
@@ -535,18 +558,12 @@ class Sub2APIImagesProvider:
                 allow_redirects=False,
             ) as response:
                 body = await _read_limited_body(response, options.max_output_bytes)
-                if response.status < 200 or response.status >= 300:
-                    if response.status >= 400:
-                        payload = _parse_json(body, response.status)
-                        raise _classified_upstream_error(
-                            response.status,
-                            payload,
-                        )
-                    raise CanvasForgeError(ErrorCode.BAD_RESPONSE)
-                payload = _parse_json(body, response.status)
-                if _payload_has_error(payload):
-                    raise _classified_upstream_error(response.status, payload)
-                return _extract_generated_image(payload, options.max_output_bytes)
+                return await asyncio.to_thread(
+                    _process_response_body,
+                    body,
+                    response.status,
+                    options.max_output_bytes,
+                )
         except CanvasForgeError:
             raise
         except (asyncio.TimeoutError, TimeoutError):
