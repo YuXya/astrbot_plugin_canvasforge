@@ -10,6 +10,7 @@ const settingKeys = [
   "cooldown_seconds",
   "max_prompt_chars",
   "max_output_mib",
+  "enable_avatar_references",
   "max_reference_images",
   "max_total_reference_mib",
   "max_reference_megapixels",
@@ -29,6 +30,8 @@ const numericSettingKeys = new Set([
   "max_reference_edge",
   "cache_max_images",
 ]);
+
+const booleanSettingKeys = new Set(["enable_avatar_references"]);
 
 const activeUpdatePhases = new Set(["accepted", "updating", "verifying"]);
 const terminalUpdatePhases = new Set(["succeeded", "failed", "interrupted"]);
@@ -595,7 +598,11 @@ function applySettings(settings) {
   for (const key of settingKeys) {
     const input = byId(key);
     if (input && Object.hasOwn(settings, key)) {
-      input.value = String(settings[key]);
+      if (booleanSettingKeys.has(key)) {
+        input.checked = settings[key] === true;
+      } else {
+        input.value = String(settings[key]);
+      }
     }
   }
   syncCompressionState();
@@ -605,7 +612,11 @@ function collectSettings() {
   const values = {};
   for (const key of settingKeys) {
     const input = byId(key);
-    values[key] = numericSettingKeys.has(key) ? Number.parseInt(input.value, 10) : input.value.trim();
+    if (booleanSettingKeys.has(key)) {
+      values[key] = input.checked;
+    } else {
+      values[key] = numericSettingKeys.has(key) ? Number.parseInt(input.value, 10) : input.value.trim();
+    }
   }
   return values;
 }

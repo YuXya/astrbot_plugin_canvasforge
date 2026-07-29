@@ -52,6 +52,7 @@ ADVANCED_DEFAULTS: dict[str, Any] = {
     "cooldown_seconds": 300,
     "max_prompt_chars": 8000,
     "max_output_mib": 20,
+    "enable_avatar_references": True,
     "max_reference_images": 3,
     "max_total_reference_mib": 30,
     "max_reference_megapixels": 40,
@@ -109,6 +110,10 @@ def _validate_setting(key: str, value: Any) -> Any:
     if key == "output_format":
         if value not in {"png", "jpeg", "webp"}:
             raise ValueError("输出格式选项无效")
+        return value
+    if key == "enable_avatar_references":
+        if not isinstance(value, bool):
+            raise ValueError("头像参考开关必须是布尔值")
         return value
 
     ranges = {

@@ -143,14 +143,29 @@
           </details>
 
           <details class="advanced">
-            <summary>引用图限制</summary>
+            <summary>参考图限制</summary>
             <div class="form-grid details-grid">
+              <label class="toggle-field field-wide" for="enable_avatar_references">
+                <input
+                  id="enable_avatar_references"
+                  name="enable_avatar_references"
+                  type="checkbox"
+                  checked
+                />
+                <span class="toggle-copy">
+                  <strong>允许 AI 使用 QQ 头像作为人物参考</strong>
+                  <small>仅在聊天 AI 明确选择相关人物时使用；关闭后仍可正常使用回复图片编辑。</small>
+                </span>
+              </label>
+              <p class="privacy-note field-wide">
+                开启后，选中人物的 QQ 头像与群昵称会随生图请求发送到你配置的外部 Sub2API 站点。
+              </p>
               <label class="field">
-                <span>最多引用图片</span>
+                <span>最多参考图（含头像）</span>
                 <input id="max_reference_images" name="max_reference_images" type="number" min="1" max="10" step="1" />
               </label>
               <label class="field">
-                <span>引用图合计（MiB）</span>
+                <span>参考图合计（MiB）</span>
                 <input id="max_total_reference_mib" name="max_total_reference_mib" type="number" min="15" max="150" step="1" />
               </label>
               <label class="field">

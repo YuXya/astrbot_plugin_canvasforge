@@ -47,6 +47,10 @@ class _RefreshableReferenceProblem(_ReferenceProblem):
     """A missing or stale source that a single get_msg call may repair."""
 
 
+class _ReferenceLimitProblem(_ReferenceProblem):
+    """The aggregate reference-byte limit was exceeded."""
+
+
 class _RefreshProblem(Exception):
     """The quoted OneBot message could not be refreshed."""
 
@@ -150,6 +154,11 @@ class ReferenceResolver:
                     "validation failure (%s).",
                     type(exc).__name__,
                 )
+            except _ReferenceLimitProblem as exc:
+                raise CanvasForgeError(
+                    ErrorCode.REFERENCE_LIMIT,
+                    str(exc),
+                ) from None
             except _ReferenceProblem as exc:
                 # Format, dimensions, animation and byte limits cannot be
                 # repaired by asking NapCat for the same message again.
@@ -228,6 +237,11 @@ class ReferenceResolver:
                 max_pixels=max_pixels,
                 max_edge=max_edge,
             )
+        except _ReferenceLimitProblem as exc:
+            raise CanvasForgeError(
+                ErrorCode.REFERENCE_LIMIT,
+                str(exc),
+            ) from None
         except _ReferenceProblem as exc:
             raise CanvasForgeError(
                 ErrorCode.REFERENCE_INVALID,
@@ -254,7 +268,7 @@ class ReferenceResolver:
 
             remaining_bytes = max_total_bytes - consumed_bytes
             if remaining_bytes <= 0:
-                raise _ReferenceProblem(
+                raise _ReferenceLimitProblem(
                     "引用图片合计大小超过当前限制，请减少图片后重试。",
                 )
 
@@ -298,13 +312,13 @@ class ReferenceResolver:
                 data = await asyncio.to_thread(
                     self._decode_base64,
                     normalized[len("base64://") :],
-                    min(per_image_bytes, remaining_total_bytes),
+                    per_image_bytes,
                 )
             elif prefix.startswith("data:"):
                 data = await asyncio.to_thread(
                     self._decode_data_uri,
                     normalized,
-                    min(per_image_bytes, remaining_total_bytes),
+                    per_image_bytes,
                 )
             else:
                 parsed = urlsplit(normalized)
@@ -335,7 +349,7 @@ class ReferenceResolver:
                 "单张引用图片超过 15 MiB 限制，请压缩后重试。",
             )
         if len(data) > remaining_total_bytes:
-            raise _ReferenceProblem(
+            raise _ReferenceLimitProblem(
                 "引用图片合计大小超过当前限制，请减少图片后重试。",
             )
         return data
@@ -366,7 +380,7 @@ class ReferenceResolver:
                         "单张引用图片超过 15 MiB 限制，请压缩后重试。",
                     )
                 if content_length > remaining_total_bytes:
-                    raise _ReferenceProblem(
+                    raise _ReferenceLimitProblem(
                         "引用图片合计大小超过当前限制，请减少图片后重试。",
                     )
 
@@ -378,7 +392,7 @@ class ReferenceResolver:
                         raise _ReferenceProblem(
                             "单张引用图片超过 15 MiB 限制，请压缩后重试。",
                         )
-                    raise _ReferenceProblem(
+                    raise _ReferenceLimitProblem(
                         "引用图片合计大小超过当前限制，请减少图片后重试。",
                     )
             return bytes(data)

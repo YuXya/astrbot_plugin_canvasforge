@@ -63,23 +63,28 @@
         "type": "int",
         "default": 20
       },
+      "enable_avatar_references": {
+        "description": "允许 AI 使用当前消息相关 QQ 用户的头像作为生图参考",
+        "type": "bool",
+        "default": true
+      },
       "max_reference_images": {
-        "description": "引用图片数量上限",
+        "description": "回复图片与人物头像合计数量上限",
         "type": "int",
         "default": 3
       },
       "max_total_reference_mib": {
-        "description": "全部引用图片合计大小上限（MiB）",
+        "description": "回复图片与人物头像合计大小上限（MiB）",
         "type": "int",
         "default": 30
       },
       "max_reference_megapixels": {
-        "description": "单张引用图片像素上限（百万像素）",
+        "description": "单张参考图片像素上限（百万像素）",
         "type": "int",
         "default": 40
       },
       "max_reference_edge": {
-        "description": "单张引用图片最长边上限",
+        "description": "单张参考图片最长边上限",
         "type": "int",
         "default": 8192
       },

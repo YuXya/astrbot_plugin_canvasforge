@@ -347,6 +347,51 @@ h3 {
   line-height: 1.45;
 }
 
+.toggle-field {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 13px 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  cursor: pointer;
+  background: var(--surface);
+}
+
+.toggle-field input[type="checkbox"] {
+  width: 20px;
+  min-height: 20px;
+  margin: 1px 0 0;
+  padding: 0;
+  accent-color: var(--accent);
+}
+
+.toggle-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.toggle-copy strong {
+  font-size: 0.88rem;
+}
+
+.toggle-copy small,
+.privacy-note {
+  color: var(--muted);
+  font-size: 0.76rem;
+  line-height: 1.55;
+}
+
+.privacy-note {
+  margin: -4px 0 0;
+  padding: 11px 13px;
+  border-left: 3px solid var(--accent);
+  border-radius: 0 9px 9px 0;
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+
 input,
 select {
   width: 100%;
