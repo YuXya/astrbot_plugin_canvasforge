@@ -19,6 +19,7 @@ class ErrorCode(str, Enum):
     NOT_CONFIGURED = "not_configured"
     CONFIG_INVALID = "config_invalid"
     MISSING_PROMPT = "missing_prompt"
+    MODE_MISMATCH = "mode_mismatch"
     BUSY = "busy"
     COOLDOWN = "cooldown"
     AUTH = "auth"
@@ -42,6 +43,7 @@ _DEFAULT_MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.NOT_CONFIGURED: "CanvasForge 尚未配置图片服务站点或 Key。",
     ErrorCode.CONFIG_INVALID: "CanvasForge 的图片服务配置无效，请联系管理员检查。",
     ErrorCode.MISSING_PROMPT: "请提供要生成或编辑的图片描述。",
+    ErrorCode.MODE_MISMATCH: "当前请求与所选生图工具不匹配，请选择正确的工具后重试。",
     ErrorCode.BUSY: "CanvasForge 正在处理另一张图片，请稍后再试。",
     ErrorCode.COOLDOWN: "生成冷却尚未结束，请稍后再试。",
     ErrorCode.AUTH: "图片服务鉴权失败，请管理员检查站点和 Key。",

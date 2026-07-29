@@ -43,18 +43,24 @@ from .canvasforge.web_api import WebAPI, normalize_settings
 
 PLUGIN_NAME = "astrbot_plugin_canvasforge"
 PLUGIN_AUTHOR = "YuXya"
-PLUGIN_VERSION = "v0.1.2"
+PLUGIN_VERSION = "v0.1.3"
 PLUGIN_REPOSITORY = "https://github.com/YuXya/astrbot_plugin_canvasforge"
 PLUGIN_DESCRIPTION = (
     "通过 Sub2API 调用 GPT Images，为 NapCat QQ 提供文生图与引用图编辑能力。"
 )
 MIB = 1024 * 1024
 _ADMISSION_CONTEXT_KEY = "_canvasforge_admission_runtime_v2"
-_LLM_TOOL_NAME = "canvasforge_generate_image"
+_TEXT_TO_IMAGE_TOOL_NAME = "canvasforge_text_to_image"
+_IMAGE_TO_IMAGE_TOOL_NAME = "canvasforge_image_to_image"
+_LLM_TOOL_NAMES = (
+    _TEXT_TO_IMAGE_TOOL_NAME,
+    _IMAGE_TO_IMAGE_TOOL_NAME,
+)
 _LLM_TOOL_STATE_EXTRA_KEY = "canvasforge.llm_tool_state"
 _LLM_TOOL_STOP_INSTRUCTION = (
-    "本轮不要再次调用 canvasforge_generate_image，也不要删除 "
-    "avatar_targets、改写提示词或降级成普通生图后重试；"
+    "本轮不要再次调用 canvasforge_text_to_image 或 "
+    "canvasforge_image_to_image，也不要在两个工具之间切换、删除 "
+    "avatar_targets、改写提示词或降级重试；"
     "请直接向用户说明失败原因，并等待用户发送新消息。"
 )
 
@@ -130,7 +136,7 @@ class CanvasForgePlugin(Star):
     async def initialize(self) -> None:
         """Create long-lived resources without requiring a configured Key."""
 
-        self._configure_llm_tool_schema()
+        self._configure_llm_tool_schemas()
         await self._ensure_runtime()
         await self._update_coordinator.initialize()
         settings = await self._get_advanced_settings()
@@ -145,20 +151,57 @@ class CanvasForgePlugin(Star):
                 type(exc).__name__,
             )
 
-    @filter.llm_tool(name=_LLM_TOOL_NAME)
-    async def canvasforge_generate_image(
+    @filter.llm_tool(name=_TEXT_TO_IMAGE_TOOL_NAME)
+    async def canvasforge_text_to_image(
+        self,
+        event: AstrMessageEvent,
+        prompt: str = "",
+    ) -> str:
+        """仅根据文字描述生成一张全新图片，不读取或使用任何参考图片。
+
+        只有用户要求从零创作、当前消息没有直接回复图片，并且不需要使用任何
+        QQ 人物头像时才能调用本工具。用户要求编辑、模仿或延续回复图片，或者
+        要把“我、你、机器人、某位被 @ 的群友”本人画进图片时，必须改用
+        canvasforge_image_to_image，不能调用本工具生成相似人物来替代参考图。
+        本工具允许按用户要求自由设计人物外貌。
+
+        当前聊天 AI 应自行编写完整、清晰的绘图提示词。工具不会额外调用聊天
+        模型，也不会返回 revised_prompt 或 usage。每条用户消息最多只能调用
+        一个 CanvasForge 工具一次；本工具返回任何失败后，禁止切换到图生图工具
+        或改写提示词重试，应直接向用户说明原因并等待新消息。
+
+        Args:
+            prompt(string): 由当前聊天 AI 编写的完整文生图提示词。
+        """
+
+        return await self._run_llm_tool(
+            event,
+            prompt,
+            requested_mode="generate",
+            avatar_targets=None,
+        )
+
+    @filter.llm_tool(name=_IMAGE_TO_IMAGE_TOOL_NAME)
+    async def canvasforge_image_to_image(
         self,
         event: AstrMessageEvent,
         prompt: str = "",
         avatar_targets: list[str] | None = None,
     ) -> str:
-        """生成图片，或使用直接引用图片及明确选择的 QQ 人物头像进行编辑。
+        """使用直接回复图片或明确选择的 QQ 人物头像编辑生成一张图片。
 
-        当前聊天 AI 应自行编写完整、清晰的绘图提示词。工具不会额外调用聊天
-        模型，也不会返回 revised_prompt 或 usage。每条用户消息最多调用本工具
-        一次；只要工具返回任何失败，本轮就必须停止，禁止删除 avatar_targets
-        或修改提示词后再次调用，也禁止降级为不带头像的普通生图。应直接向用户
-        说明失败原因并等待其发送新消息。
+        只有至少存在一张参考图时才能调用本工具。参考图来源是当前消息直接回复
+        的图片，以及 avatar_targets 明确选择的人物头像；不读取当前消息附图、
+        嵌套回复或历史消息。只有回复图片、不使用头像时也必须显式传
+        avatar_targets=[]。没有回复图片且 avatar_targets 为空时，应使用
+        canvasforge_text_to_image，不得调用本工具。
+
+        图生图硬性规则：prompt 只描述“人物参考1、人物参考2……”的动作、关系、
+        构图、场景和画风，不得擅自编造主角的年龄、脸型、发型、发色、瞳色、
+        物种特征、身材或服装，人物外貌必须以参考图为准。禁止写
+        “莉莉（金发双马尾）”“优夏（黑长直）”这类未经用户明确要求的设定。
+        只有用户原话明确要求改变某项外貌时，才可另起一句，以
+        “用户明确要求的外貌变更：”开头列出该变化。
 
         人物选择器必须严格按以下语义填写：
         - 用户说“我、本人、发送者”时使用 sender，不能把发送者算作 mention:N。
@@ -168,18 +211,31 @@ class CanvasForgePlugin(Star):
         - “把我和你画成合照”应使用 ["sender", "bot"]。
         - “你抱住 @小明，@小红在旁边”应使用
           ["bot", "mention:1", "mention:2"]。
-        avatar_targets 非空时，prompt 应使用“人物参考1、人物参考2……”为人物
-        分配动作、关系和位置，不要凭空指定与头像冲突的脸型、发型、发色等外貌；
-        人物外观以对应头像为准。
-        avatar_targets 是必填的意图确认字段：确实要把人物画进图片时填写对应
-        选择器；完全不需要人物头像时也必须显式填写空数组 []。不要省略该字段，
-        不要传 QQ 号、URL、昵称或根据历史消息猜测人物；没有直接 @ 时不要使用
-        mention:N。
+        不要传 QQ 号、URL、昵称或根据历史消息猜测人物。普通提及不代表要把
+        对方画进图片。每条用户消息最多只能调用一个 CanvasForge 工具一次；
+        本工具返回任何失败后，禁止切换到文生图工具降级重试。
 
         Args:
-            prompt(string): 由当前聊天 AI 编写的完整绘图或编辑提示词。
-            avatar_targets(array[string]): 必填；不使用人物头像时传 []。使用时按人物顺序填写：我/发送者=sender，你/机器人=bot，mention:N=排除机器人唤醒 @ 后第 N 个直接 @ 群友。不要传 QQ 号、URL、昵称、重复选择器或同一人物。
+            prompt(string): 由当前聊天 AI 编写的完整图生图提示词。
+            avatar_targets(array[string]): 必填；只使用回复图片时传 []。使用头像时按人物参考顺序填写：我/发送者=sender，你/机器人=bot，mention:N=排除机器人唤醒 @ 后第 N 个直接 @ 群友。不要传 QQ 号、URL、昵称、重复选择器或同一人物。
         """
+
+        return await self._run_llm_tool(
+            event,
+            prompt,
+            requested_mode="edit",
+            avatar_targets=avatar_targets,
+        )
+
+    async def _run_llm_tool(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        *,
+        requested_mode: str,
+        avatar_targets: list[str] | None,
+    ) -> str:
+        """Run either public LLM tool through one shared same-event guard."""
 
         previous_state = event.get_extra(_LLM_TOOL_STATE_EXTRA_KEY)
         if previous_state:
@@ -190,17 +246,18 @@ class CanvasForgePlugin(Star):
         event.set_extra(_LLM_TOOL_STATE_EXTRA_KEY, "running")
 
         try:
-            if avatar_targets is None:
+            if requested_mode == "edit" and avatar_targets is None:
                 raise CanvasForgeError(
                     ErrorCode.AVATAR_TARGET_INVALID,
                     "当前聊天 AI 未提交必填的 avatar_targets；"
-                    "不需要人物头像时也必须传空数组。本次尚未调用图像接口。",
+                    "只使用回复图片时也必须传空数组。本次尚未调用图像接口。",
                 )
             mode = await self._generate_and_send(
                 event,
                 prompt,
                 send_progress=False,
                 avatar_targets=avatar_targets,
+                requested_mode=requested_mode,
             )
         except CanvasForgeError as exc:
             event.set_extra(_LLM_TOOL_STATE_EXTRA_KEY, "failed")
@@ -266,9 +323,12 @@ class CanvasForgePlugin(Star):
         *,
         send_progress: bool,
         avatar_targets: list[str] | None = None,
+        requested_mode: str | None = None,
     ) -> str:
         """Run one paid request and commit cooldown only after QQ delivery."""
 
+        if requested_mode not in (None, "generate", "edit"):
+            raise CanvasForgeError(ErrorCode.INTERNAL)
         await self._reject_if_updating()
         if event.get_platform_name() != "aiocqhttp":
             raise CanvasForgeError(ErrorCode.PLATFORM_UNSUPPORTED)
@@ -296,9 +356,19 @@ class CanvasForgePlugin(Star):
                 reference_resolver,
                 avatar_resolver,
             ) = await self._ensure_runtime()
-            if avatar_targets and not settings["enable_avatar_references"]:
-                raise CanvasForgeError(ErrorCode.AVATAR_DISABLED)
-            planned_avatars = avatar_resolver.plan(event, avatar_targets)
+            if requested_mode == "generate":
+                if await reference_resolver.has_direct_images(event):
+                    raise CanvasForgeError(
+                        ErrorCode.MODE_MISMATCH,
+                        "当前消息直接回复了图片，应该使用 "
+                        "canvasforge_image_to_image 图生图工具；"
+                        "本次尚未调用图片接口。",
+                    )
+                planned_avatars = []
+            else:
+                if avatar_targets and not settings["enable_avatar_references"]:
+                    raise CanvasForgeError(ErrorCode.AVATAR_DISABLED)
+                planned_avatars = avatar_resolver.plan(event, avatar_targets)
 
             # Bind URL and Key only after winning the non-queuing global gate.
             # This request-local provider cannot be changed by a concurrent
@@ -320,14 +390,17 @@ class CanvasForgePlugin(Star):
                         "无法向 QQ 发送进度消息，本次生成已取消。",
                     ) from None
 
-            references = await reference_resolver.resolve(
-                event,
-                max_images=settings["max_reference_images"],
-                max_total_bytes=settings["max_total_reference_mib"] * MIB,
-                per_image_bytes=DEFAULT_PER_IMAGE_BYTES,
-                max_pixels=settings["max_reference_megapixels"] * 1_000_000,
-                max_edge=settings["max_reference_edge"],
-            )
+            if requested_mode == "generate":
+                references = []
+            else:
+                references = await reference_resolver.resolve(
+                    event,
+                    max_images=settings["max_reference_images"],
+                    max_total_bytes=settings["max_total_reference_mib"] * MIB,
+                    per_image_bytes=DEFAULT_PER_IMAGE_BYTES,
+                    max_pixels=settings["max_reference_megapixels"] * 1_000_000,
+                    max_edge=settings["max_reference_edge"],
+                )
             if (
                 len(references) + len(planned_avatars)
                 > settings["max_reference_images"]
@@ -353,20 +426,32 @@ class CanvasForgePlugin(Star):
                 resolved.reference for resolved in resolved_avatars
             ]
             references = [*references, *avatar_references]
+            if requested_mode == "edit" and not references:
+                raise CanvasForgeError(
+                    ErrorCode.MODE_MISMATCH,
+                    "图生图工具至少需要一张直接回复图片或一个人物头像；"
+                    "没有参考图时应该使用 canvasforge_text_to_image。"
+                    "本次尚未调用图片接口。",
+                )
             request_prompt = self._with_avatar_mapping(
                 normalized_prompt,
                 resolved_avatars,
                 reply_reference_count=len(references) - len(resolved_avatars),
             )
+            request_prompt = self._with_edit_reference_guard(
+                request_prompt,
+                has_references=bool(references),
+                has_avatar_references=bool(resolved_avatars),
+            )
             request_prompt = self._validate_prompt(
                 request_prompt,
                 settings["max_prompt_chars"],
             )
-            mode = "edit" if references else "generate"
+            mode = requested_mode or ("edit" if references else "generate")
             reply_reference_count = len(references) - len(resolved_avatars)
             logger.info(
-                "CanvasForge prepared a %s request "
-                "(reply_references=%d, avatar_references=%d, "
+                "CanvasForge prepared an Images API request "
+                "(mode=%s, reply_references=%d, avatar_references=%d, "
                 "total_references=%d).",
                 mode,
                 reply_reference_count,
@@ -388,7 +473,7 @@ class CanvasForgePlugin(Star):
                 max_output_bytes=settings["max_output_mib"] * MIB,
             )
 
-            if references:
+            if mode == "edit":
                 image = await provider.edit(
                     request_prompt,
                     references,
@@ -816,48 +901,81 @@ class CanvasForgePlugin(Star):
             )
         return prompt + "\n".join(lines)
 
-    def _configure_llm_tool_schema(self) -> None:
-        """Require the model to make an explicit avatar-reference decision.
+    @staticmethod
+    def _with_edit_reference_guard(
+        prompt: str,
+        *,
+        has_references: bool,
+        has_avatar_references: bool,
+    ) -> str:
+        """Make reference appearance authoritative over model-invented traits."""
 
-        AstrBot 4.26.8's deprecated decorator registration path preserves
-        array ``items`` but does not mark parsed parameters as required.
-        Tightening the registered schema prevents a model from silently
-        omitting ``avatar_targets`` and accidentally turning a portrait
-        request into text-to-image generation.
-        """
+        if not has_references:
+            return prompt
+        guard = (
+            "\n\n参考图编辑硬性规则（优先级高于前文中的人物外貌描述）："
+            "参考图中的主角外貌是权威来源。除非前文使用精确标记"
+            "“用户明确要求的外貌变更：”，否则必须忽略前文擅自添加的年龄、"
+            "脸型、发型、发色、瞳色、物种特征、身材和服装设定；不得根据"
+            "昵称、人设、历史信息或常见角色形象重新设计主角。可以按任务改变"
+            "动作、关系、构图、场景和画风，但必须保持人物可辨识。"
+        )
+        if has_avatar_references:
+            guard += (
+                "上方人物参考映射中的每张 QQ 头像都必须实际用于对应人物，"
+                "不得遗漏、互换或只当作画风参考。"
+            )
+        return prompt + guard
+
+    def _configure_llm_tool_schemas(self) -> None:
+        """Require explicit parameters on both CanvasForge tools."""
 
         try:
             manager = self.context.get_llm_tool_manager()
             tools = getattr(manager, "func_list", ())
+            found: set[str] = set()
             for tool in tools:
-                if getattr(tool, "name", "") != _LLM_TOOL_NAME:
+                tool_name = getattr(tool, "name", "")
+                if tool_name not in _LLM_TOOL_NAMES:
                     continue
                 parameters = copy.deepcopy(getattr(tool, "parameters", {}))
                 properties = parameters.get("properties")
                 if not isinstance(properties, dict):
                     raise TypeError("tool properties are unavailable")
-                avatar_schema = properties.get("avatar_targets")
-                if not isinstance(avatar_schema, dict):
-                    raise TypeError("avatar target schema is unavailable")
-                avatar_schema.update(
-                    {
-                        "type": "array",
-                        "items": {
-                            "type": "string",
-                            "pattern": r"^(sender|bot|mention:[1-9][0-9]*)$",
+                if not isinstance(properties.get("prompt"), dict):
+                    raise TypeError("prompt schema is unavailable")
+
+                if tool_name == _IMAGE_TO_IMAGE_TOOL_NAME:
+                    avatar_schema = properties.get("avatar_targets")
+                    if not isinstance(avatar_schema, dict):
+                        raise TypeError("avatar target schema is unavailable")
+                    avatar_schema.update(
+                        {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "pattern": (
+                                    r"^(sender|bot|mention:[1-9][0-9]*)$"
+                                ),
+                            },
+                            "maxItems": 10,
+                            "uniqueItems": True,
                         },
-                        "maxItems": 10,
-                        "uniqueItems": True,
-                    },
-                )
-                parameters["required"] = ["prompt", "avatar_targets"]
+                    )
+                    required = ["prompt", "avatar_targets"]
+                else:
+                    required = ["prompt"]
+
+                parameters["required"] = required
                 parameters["additionalProperties"] = False
                 tool.parameters = parameters
-                return
-            raise LookupError("tool registration is unavailable")
+                found.add(tool_name)
+
+            if found != set(_LLM_TOOL_NAMES):
+                raise LookupError("tool registration is unavailable")
         except Exception as exc:
             logger.warning(
-                "CanvasForge could not tighten the LLM tool schema (%s); "
+                "CanvasForge could not tighten the LLM tool schemas (%s); "
                 "runtime validation remains enabled.",
                 type(exc).__name__,
             )

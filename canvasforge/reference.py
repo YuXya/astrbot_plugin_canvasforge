@@ -80,6 +80,42 @@ class ReferenceResolver:
         self._context = context
         self._session = session
 
+    async def has_direct_images(self, event: AstrMessageEvent) -> bool:
+        """Check whether the directly replied-to message contains images.
+
+        Parsed reply components are inspected without downloading image bytes.
+        If AstrBot did not hydrate the quoted message, one short ``get_msg``
+        refresh is used, matching ``resolve()`` without following nested
+        replies or reading images attached to the current message.
+        """
+
+        reply = self._first_reply(event)
+        if reply is not None:
+            chain = reply.chain if isinstance(reply.chain, (list, tuple)) else []
+            if any(isinstance(item, Image) for item in chain):
+                return True
+            if chain:
+                # A populated direct reply chain was already parsed by
+                # AstrBot. Do not turn an ordinary text reply into an extra
+                # OneBot get_msg request merely to select an LLM tool.
+                return False
+            refresh_target: Any = reply
+        else:
+            refresh_target = self._raw_reply_id(event)
+            if refresh_target is None:
+                return False
+
+        try:
+            refreshed = await self._refresh_sources(event, refresh_target)
+        except _RefreshProblem as exc:
+            logger.warning(
+                "CanvasForge could not inspect a quoted message for tool "
+                "selection (%s).",
+                type(exc).__name__,
+            )
+            raise self._invalid_reference_error() from None
+        return bool(refreshed)
+
     async def resolve(
         self,
         event: AstrMessageEvent,
