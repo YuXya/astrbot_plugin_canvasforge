@@ -43,7 +43,7 @@ from .canvasforge.web_api import WebAPI, normalize_settings
 
 PLUGIN_NAME = "astrbot_plugin_canvasforge"
 PLUGIN_AUTHOR = "YuXya"
-PLUGIN_VERSION = "v0.1.3"
+PLUGIN_VERSION = "v0.1.4"
 PLUGIN_REPOSITORY = "https://github.com/YuXya/astrbot_plugin_canvasforge"
 PLUGIN_DESCRIPTION = (
     "通过 Sub2API 调用 GPT Images，为 NapCat QQ 提供文生图与引用图编辑能力。"
@@ -56,33 +56,6 @@ _LLM_TOOL_NAMES = (
     _TEXT_TO_IMAGE_TOOL_NAME,
     _IMAGE_TO_IMAGE_TOOL_NAME,
 )
-_LLM_TOOL_STATE_EXTRA_KEY = "canvasforge.llm_tool_state"
-_LLM_TOOL_STOP_INSTRUCTION = (
-    "本轮不要再次调用 canvasforge_text_to_image 或 "
-    "canvasforge_image_to_image，也不要在两个工具之间切换、删除 "
-    "avatar_targets、改写提示词或降级重试；"
-    "请直接向用户说明失败原因，并等待用户发送新消息。"
-)
-
-
-def _llm_tool_repeat_result(state: object) -> str:
-    """Tell the agent how to finish after a duplicate same-event call."""
-
-    if state == "succeeded":
-        return (
-            "CanvasForge 本轮已经成功执行并发送图片，不会再次执行。"
-            "不要继续调用本工具；请直接告诉用户图片已经发送。"
-        )
-    if state == "failed":
-        return (
-            "CanvasForge 本轮此前的调用已经失败，不会再次执行。"
-            "不要继续调用本工具，也不要删除头像参数或降级重试；"
-            "请依据上一次工具错误向用户说明原因，并等待用户发送新消息。"
-        )
-    return (
-        "CanvasForge 本轮已有一次调用正在执行或被中断，不会并行或再次执行。"
-        "不要继续调用本工具；请等待已有结果，或向用户说明本轮无法再次生成。"
-    )
 
 
 @register(
@@ -166,9 +139,9 @@ class CanvasForgePlugin(Star):
         本工具允许按用户要求自由设计人物外貌。
 
         当前聊天 AI 应自行编写完整、清晰的绘图提示词。工具不会额外调用聊天
-        模型，也不会返回 revised_prompt 或 usage。每条用户消息最多只能调用
-        一个 CanvasForge 工具一次；本工具返回任何失败后，禁止切换到图生图工具
-        或改写提示词重试，应直接向用户说明原因并等待新消息。
+        模型，也不会返回 revised_prompt 或 usage。工具失败后可依据错误原因决定
+        是否再次尝试；如果错误明确要求使用图生图工具，可以改用对应工具。
+        不要把一次失败理解为后续新消息也禁止生图，也不要无条件无限重试。
 
         Args:
             prompt(string): 由当前聊天 AI 编写的完整文生图提示词。
@@ -212,8 +185,8 @@ class CanvasForgePlugin(Star):
         - “你抱住 @小明，@小红在旁边”应使用
           ["bot", "mention:1", "mention:2"]。
         不要传 QQ 号、URL、昵称或根据历史消息猜测人物。普通提及不代表要把
-        对方画进图片。每条用户消息最多只能调用一个 CanvasForge 工具一次；
-        本工具返回任何失败后，禁止切换到文生图工具降级重试。
+        对方画进图片。工具失败后可依据错误原因再次尝试；如果错误明确说明没有
+        参考图，可以改用文生图工具。不要无条件无限重试。
 
         Args:
             prompt(string): 由当前聊天 AI 编写的完整图生图提示词。
@@ -235,15 +208,7 @@ class CanvasForgePlugin(Star):
         requested_mode: str,
         avatar_targets: list[str] | None,
     ) -> str:
-        """Run either public LLM tool through one shared same-event guard."""
-
-        previous_state = event.get_extra(_LLM_TOOL_STATE_EXTRA_KEY)
-        if previous_state:
-            return _llm_tool_repeat_result(previous_state)
-        # This synchronous write happens before the first await, so parallel
-        # tool calls for the same AstrMessageEvent cannot both enter the paid
-        # generation flow.
-        event.set_extra(_LLM_TOOL_STATE_EXTRA_KEY, "running")
+        """Run either public LLM tool with common error formatting."""
 
         try:
             if requested_mode == "edit" and avatar_targets is None:
@@ -260,13 +225,8 @@ class CanvasForgePlugin(Star):
                 requested_mode=requested_mode,
             )
         except CanvasForgeError as exc:
-            event.set_extra(_LLM_TOOL_STATE_EXTRA_KEY, "failed")
-            return (
-                f"CanvasForge 工具调用失败（{exc.code.value}）：{exc} "
-                f"{_LLM_TOOL_STOP_INSTRUCTION}"
-            )
+            return f"CanvasForge 工具调用失败（{exc.code.value}）：{exc}"
         except Exception as exc:
-            event.set_extra(_LLM_TOOL_STATE_EXTRA_KEY, "failed")
             logger.error(
                 "CanvasForge tool failed unexpectedly (%s).",
                 type(exc).__name__,
@@ -275,10 +235,8 @@ class CanvasForgePlugin(Star):
                 "CanvasForge 工具调用失败"
                 f"（{ErrorCode.INTERNAL.value}）："
                 "CanvasForge 处理请求时发生内部错误，请稍后再试。"
-                f" {_LLM_TOOL_STOP_INSTRUCTION}"
             )
 
-        event.set_extra(_LLM_TOOL_STATE_EXTRA_KEY, "succeeded")
         action = "引用图编辑" if mode == "edit" else "图片生成"
         return f"CanvasForge 已完成{action}，图片已发送到当前 QQ 会话。"
 
