@@ -169,8 +169,14 @@ class AvatarResolver:
                 fallback_name = "机器人"
             else:
                 match = _SELECTOR_PATTERN.fullmatch(selector)
-                if match is None or not group_id:
+                if match is None:
                     raise self._invalid_target_error()
+                if not group_id:
+                    raise CanvasForgeError(
+                        ErrorCode.AVATAR_TARGET_INVALID,
+                        "mention:N 只能用于群聊中的直接 @ 群友；"
+                        "私聊请使用 sender 或 bot。",
+                    )
                 ordinal_text = match.group(1)
                 if len(ordinal_text) > _MAX_MENTION_DIGITS:
                     raise self._invalid_target_error()
@@ -179,7 +185,17 @@ class AvatarResolver:
                 except ValueError:
                     raise self._invalid_target_error() from None
                 if ordinal > len(mentions):
-                    raise self._invalid_target_error()
+                    if mentions:
+                        detail = (
+                            f"当前消息只有 {len(mentions)} 个可用的直接 @ 群友"
+                        )
+                    else:
+                        detail = "当前消息没有可用的直接 @ 群友"
+                    raise CanvasForgeError(
+                        ErrorCode.AVATAR_TARGET_INVALID,
+                        f"{detail}；发送者请用 sender，机器人请用 bot，"
+                        "不要把两者计入 mention:N。",
+                    )
                 user_id = mentions[ordinal - 1]
                 name_hint = component_names.get(user_id, "")
                 fallback_name = f"群友{ordinal}"
@@ -723,7 +739,9 @@ class AvatarResolver:
     def _invalid_target_error() -> CanvasForgeError:
         return CanvasForgeError(
             ErrorCode.AVATAR_TARGET_INVALID,
-            "头像人物选择无效，请让当前聊天 AI 重新确认要绘制的人物。",
+            "头像人物选择无效：发送者请用 sender，机器人请用 bot；"
+            "mention:N 只表示当前群消息中排除机器人唤醒 @ 后的"
+            "第 N 个直接 @ 群友。",
         )
 
     @staticmethod

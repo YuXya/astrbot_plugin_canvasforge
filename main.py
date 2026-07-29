@@ -48,6 +48,32 @@ PLUGIN_DESCRIPTION = (
 )
 MIB = 1024 * 1024
 _ADMISSION_CONTEXT_KEY = "_canvasforge_admission_runtime_v2"
+_LLM_TOOL_STATE_EXTRA_KEY = "canvasforge.llm_tool_state"
+_LLM_TOOL_STOP_INSTRUCTION = (
+    "本轮不要再次调用 canvasforge_generate_image，也不要删除 "
+    "avatar_targets、改写提示词或降级成普通生图后重试；"
+    "请直接向用户说明失败原因，并等待用户发送新消息。"
+)
+
+
+def _llm_tool_repeat_result(state: object) -> str:
+    """Tell the agent how to finish after a duplicate same-event call."""
+
+    if state == "succeeded":
+        return (
+            "CanvasForge 本轮已经成功执行并发送图片，不会再次执行。"
+            "不要继续调用本工具；请直接告诉用户图片已经发送。"
+        )
+    if state == "failed":
+        return (
+            "CanvasForge 本轮此前的调用已经失败，不会再次执行。"
+            "不要继续调用本工具，也不要删除头像参数或降级重试；"
+            "请依据上一次工具错误向用户说明原因，并等待用户发送新消息。"
+        )
+    return (
+        "CanvasForge 本轮已有一次调用正在执行或被中断，不会并行或再次执行。"
+        "不要继续调用本工具；请等待已有结果，或向用户说明本轮无法再次生成。"
+    )
 
 
 @register(
@@ -124,12 +150,34 @@ class CanvasForgePlugin(Star):
         """生成图片，或使用直接引用图片及明确选择的 QQ 人物头像进行编辑。
 
         当前聊天 AI 应自行编写完整、清晰的绘图提示词。工具不会额外调用聊天
-        模型，也不会返回 revised_prompt 或 usage。
+        模型，也不会返回 revised_prompt 或 usage。每条用户消息最多调用本工具
+        一次；只要工具返回任何失败，本轮就必须停止，禁止删除 avatar_targets
+        或修改提示词后再次调用，也禁止降级为不带头像的普通生图。应直接向用户
+        说明失败原因并等待其发送新消息。
+
+        人物选择器必须严格按以下语义填写：
+        - 用户说“我、本人、发送者”时使用 sender，不能把发送者算作 mention:N。
+        - 用户说“你、机器人、助手、当前聊天 AI”时使用 bot。
+        - mention:N 仅表示当前群消息中第 N 个直接 @ 的其他群友；计数会排除
+          唤醒机器人的 @、@全体成员、重复 @、回复消息及嵌套引用中的 @。
+        - “把我和你画成合照”应使用 ["sender", "bot"]。
+        - “你抱住 @小明，@小红在旁边”应使用
+          ["bot", "mention:1", "mention:2"]。
+        只有确实要把对应人物画进图片时才填写 avatar_targets。不要传 QQ 号、
+        URL、昵称或根据历史消息猜测人物；没有直接 @ 时不要使用 mention:N。
 
         Args:
             prompt(string): 由当前聊天 AI 编写的完整绘图或编辑提示词。
-            avatar_targets(array[string]): 仅当确实要把人物画进图中时填写；按人物顺序使用 sender、bot 或群聊 mention:1、mention:2 等，普通提及不要填写，且不要传 QQ 号、URL、重复选择器或同一人物。
+            avatar_targets(array[string]): 有序人物选择器；我/发送者=sender，你/机器人=bot，mention:N=排除机器人唤醒 @ 后第 N 个直接 @ 群友。仅在确实要画出人物时填写；不要传 QQ 号、URL、昵称、重复选择器或同一人物。
         """
+
+        previous_state = event.get_extra(_LLM_TOOL_STATE_EXTRA_KEY)
+        if previous_state:
+            return _llm_tool_repeat_result(previous_state)
+        # This synchronous write happens before the first await, so parallel
+        # tool calls for the same AstrMessageEvent cannot both enter the paid
+        # generation flow.
+        event.set_extra(_LLM_TOOL_STATE_EXTRA_KEY, "running")
 
         try:
             mode = await self._generate_and_send(
@@ -139,10 +187,13 @@ class CanvasForgePlugin(Star):
                 avatar_targets=avatar_targets,
             )
         except CanvasForgeError as exc:
+            event.set_extra(_LLM_TOOL_STATE_EXTRA_KEY, "failed")
             return (
-                f"CanvasForge 工具调用失败（{exc.code.value}）：{exc}"
+                f"CanvasForge 工具调用失败（{exc.code.value}）：{exc} "
+                f"{_LLM_TOOL_STOP_INSTRUCTION}"
             )
         except Exception as exc:
+            event.set_extra(_LLM_TOOL_STATE_EXTRA_KEY, "failed")
             logger.error(
                 "CanvasForge tool failed unexpectedly (%s).",
                 type(exc).__name__,
@@ -151,8 +202,10 @@ class CanvasForgePlugin(Star):
                 "CanvasForge 工具调用失败"
                 f"（{ErrorCode.INTERNAL.value}）："
                 "CanvasForge 处理请求时发生内部错误，请稍后再试。"
+                f" {_LLM_TOOL_STOP_INSTRUCTION}"
             )
 
+        event.set_extra(_LLM_TOOL_STATE_EXTRA_KEY, "succeeded")
         action = "引用图编辑" if mode == "edit" else "图片生成"
         return f"CanvasForge 已完成{action}，图片已发送到当前 QQ 会话。"
 
