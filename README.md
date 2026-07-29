@@ -10,7 +10,7 @@ CanvasForge 是面向 AstrBot + NapCat QQ 的图片生成插件。它通过 Sub2
 
 ## 运行要求
 
-- AstrBot `>= 4.26.8`
+- AstrBot `>= 4.26.6`
 - NapCat / OneBot v11，消息格式必须为 `array`
 - Python 依赖见 `requirements.txt`
 - 可用的 Sub2API 站点地址与 API Key
@@ -85,11 +85,11 @@ CanvasForge 控制台会检查
 - 控制台不会读取或转发 Dashboard Token，也不接受页面传入的仓库、下载地址、代理或 Commit；
 - GitHub 连接失败时，请改用 AstrBot 插件管理中的“更新/重新安装”，并在那里选择需要的 GitHub 代理。
 
-页内更新使用 AstrBot `4.26.8` 当前仍兼容的内部插件更新能力，并会在接口不可用时停止操作、提示使用原生更新入口。AstrBot 核心更新不是完整的事务式安装：如果新代码覆盖后发生依赖或重载失败，可能仍需从插件管理按 GitHub 地址重新安装。
+页内更新会先检测当前 AstrBot 是否提供兼容的内部插件更新能力；接口不存在或签名不兼容时会停止操作并提示使用原生更新入口。AstrBot 核心更新不是完整的事务式安装：如果新代码覆盖后发生依赖或重载失败，可能仍需从插件管理按 GitHub 地址重新安装。
 
 CanvasForge 不保存历史更新包或旧版本备份。AstrBot 核心只复用一个固定名称的临时 ZIP，成功后删除；极端清理失败时，下一次更新也会覆盖同一路径，不会按版本无限累计。
 
-CanvasForge 自身不会记录下载地址、Commit、插件路径或响应正文。AstrBot `4.26.8` 的核心更新器仍可能按其原生行为在 AstrBot 日志中记录固定 GitHub 归档地址和插件安装路径；其中不含 Sub2API Key 或 Dashboard 凭据，插件也不会通过全局日志修改去掩盖上游日志。
+CanvasForge 自身不会记录下载地址、Commit、插件路径或响应正文。AstrBot 核心更新器仍可能按其原生行为在 AstrBot 日志中记录固定 GitHub 归档地址和插件安装路径；其中不含 Sub2API Key 或 Dashboard 凭据，插件也不会通过全局日志修改去掩盖上游日志。
 
 ### 发布新版本
 

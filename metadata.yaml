@@ -8,4 +8,4 @@ repo: https://github.com/YuXya/astrbot_plugin_canvasforge
 license: AGPL-3.0
 support_platforms:
   - aiocqhttp
-astrbot_version: ">=4.26.8"
+astrbot_version: ">=4.26.6"
