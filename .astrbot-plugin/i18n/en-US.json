@@ -1,0 +1,12 @@
+{
+  "metadata": {
+    "display_name": "CanvasForge",
+    "desc": "Generate and edit images for NapCat QQ through Sub2API GPT Images."
+  },
+  "pages": {
+    "canvasforge": {
+      "title": "CanvasForge Console",
+      "description": "Manage image generation settings and recent results."
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "metadata": {
+    "display_name": "CanvasForge",
+    "desc": "通过 Sub2API 调用 GPT Images，为 NapCat QQ 提供文生图与引用图编辑能力。"
+  },
+  "pages": {
+    "canvasforge": {
+      "title": "CanvasForge 控制台",
+      "description": "管理图片生成设置与最近生成结果。"
+    }
+  }
+}

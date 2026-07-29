@@ -1,0 +1,93 @@
+{
+  "base_url": {
+    "description": "Sub2API 站点地址",
+    "type": "string",
+    "default": "",
+    "hint": "填写站点根地址、带版本的 Base URL 或完整 Images 接口地址。公网站点必须使用 HTTPS。"
+  },
+  "api_key": {
+    "description": "Sub2API API Key",
+    "type": "string",
+    "default": "",
+    "hint": "通过 Authorization: Bearer 请求头发送。AstrBot 当前会将此值明文保存在插件配置文件中，请保护配置文件权限。",
+    "obvious_hint": true,
+    "password": true
+  },
+  "advanced": {
+    "description": "由 CanvasForge 控制台管理的高级设置",
+    "type": "object",
+    "invisible": true,
+    "items": {
+      "model": {
+        "description": "图像模型",
+        "type": "string",
+        "default": "gpt-image-2"
+      },
+      "size": {
+        "description": "输出尺寸",
+        "type": "string",
+        "default": "1024x1024"
+      },
+      "quality": {
+        "description": "输出质量",
+        "type": "string",
+        "default": "medium"
+      },
+      "output_format": {
+        "description": "输出格式",
+        "type": "string",
+        "default": "png"
+      },
+      "output_compression": {
+        "description": "JPEG/WebP 压缩质量",
+        "type": "int",
+        "default": 90
+      },
+      "request_timeout_seconds": {
+        "description": "生图请求超时（秒）",
+        "type": "int",
+        "default": 300
+      },
+      "cooldown_seconds": {
+        "description": "每位用户的成功请求冷却（秒）",
+        "type": "int",
+        "default": 300
+      },
+      "max_prompt_chars": {
+        "description": "提示词字符上限",
+        "type": "int",
+        "default": 8000
+      },
+      "max_output_mib": {
+        "description": "输出图片大小上限（MiB）",
+        "type": "int",
+        "default": 20
+      },
+      "max_reference_images": {
+        "description": "引用图片数量上限",
+        "type": "int",
+        "default": 3
+      },
+      "max_total_reference_mib": {
+        "description": "全部引用图片合计大小上限（MiB）",
+        "type": "int",
+        "default": 30
+      },
+      "max_reference_megapixels": {
+        "description": "单张引用图片像素上限（百万像素）",
+        "type": "int",
+        "default": 40
+      },
+      "max_reference_edge": {
+        "description": "单张引用图片最长边上限",
+        "type": "int",
+        "default": 8192
+      },
+      "cache_max_images": {
+        "description": "缓存图片数量上限，0 表示停止新增",
+        "type": "int",
+        "default": 3
+      }
+    }
+  }
+}

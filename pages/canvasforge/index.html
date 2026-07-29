@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>CanvasForge 控制台</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">CANVASFORGE</p>
+          <h1>CanvasForge 控制台</h1>
+          <p class="subtitle">调整生成参数，并管理最近生成的图片。</p>
+        </div>
+        <div class="status-dot" aria-label="控制台已连接">
+          <span aria-hidden="true"></span>
+          Plugin Page
+        </div>
+      </header>
+
+      <nav class="tabs" aria-label="控制台功能">
+        <button class="tab is-active" type="button" role="tab" aria-selected="true" aria-controls="settings-panel" data-tab="settings-panel">
+          生成设置
+        </button>
+        <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="cache-panel" data-tab="cache-panel">
+          图片缓存
+        </button>
+      </nav>
+
+      <section id="settings-panel" class="panel tab-panel" role="tabpanel">
+        <div class="panel-heading">
+          <div>
+            <h2>生成设置</h2>
+            <p>这些高级设置会立即应用到之后的生成请求。</p>
+          </div>
+        </div>
+
+        <form id="settings-form">
+          <div class="form-grid">
+            <label class="field field-wide">
+              <span>模型</span>
+              <input id="model" name="model" type="text" required autocomplete="off" />
+              <small>由当前 Sub2API 站点决定模型是否可用。</small>
+            </label>
+
+            <label class="field">
+              <span>尺寸</span>
+              <select id="size" name="size">
+                <option value="1024x1024">1024 × 1024</option>
+                <option value="1536x1024">1536 × 1024</option>
+                <option value="1024x1536">1024 × 1536</option>
+                <option value="auto">自动</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span>质量</span>
+              <select id="quality" name="quality">
+                <option value="medium">中等</option>
+                <option value="low">低</option>
+                <option value="high">高</option>
+                <option value="auto">自动</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span>输出格式</span>
+              <select id="output_format" name="output_format">
+                <option value="png">PNG</option>
+                <option value="jpeg">JPEG</option>
+                <option value="webp">WebP</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span>JPEG / WebP 压缩质量</span>
+              <input id="output_compression" name="output_compression" type="number" min="0" max="100" step="1" />
+              <small id="compression-help">仅对 JPEG 和 WebP 生效。</small>
+            </label>
+          </div>
+
+          <details class="advanced" open>
+            <summary>请求与限流</summary>
+            <div class="form-grid details-grid">
+              <label class="field">
+                <span>请求超时（秒）</span>
+                <input id="request_timeout_seconds" name="request_timeout_seconds" type="number" min="30" max="900" step="1" />
+              </label>
+              <label class="field">
+                <span>用户冷却（秒）</span>
+                <input id="cooldown_seconds" name="cooldown_seconds" type="number" min="0" max="86400" step="1" />
+              </label>
+              <label class="field">
+                <span>提示词长度上限</span>
+                <input id="max_prompt_chars" name="max_prompt_chars" type="number" min="1" max="50000" step="1" />
+              </label>
+              <label class="field">
+                <span>输出图上限（MiB）</span>
+                <input id="max_output_mib" name="max_output_mib" type="number" min="1" max="100" step="1" />
+              </label>
+            </div>
+          </details>
+
+          <details class="advanced">
+            <summary>引用图限制</summary>
+            <div class="form-grid details-grid">
+              <label class="field">
+                <span>最多引用图片</span>
+                <input id="max_reference_images" name="max_reference_images" type="number" min="1" max="10" step="1" />
+              </label>
+              <label class="field">
+                <span>引用图合计（MiB）</span>
+                <input id="max_total_reference_mib" name="max_total_reference_mib" type="number" min="15" max="150" step="1" />
+              </label>
+              <label class="field">
+                <span>单图像素（百万）</span>
+                <input id="max_reference_megapixels" name="max_reference_megapixels" type="number" min="1" max="100" step="1" />
+              </label>
+              <label class="field">
+                <span>单图最长边（px）</span>
+                <input id="max_reference_edge" name="max_reference_edge" type="number" min="512" max="16384" step="1" />
+              </label>
+            </div>
+          </details>
+
+          <details class="advanced">
+            <summary>本地缓存</summary>
+            <div class="form-grid details-grid">
+              <label class="field">
+                <span>保留最近图片</span>
+                <input id="cache_max_images" name="cache_max_images" type="number" min="0" max="20" step="1" />
+                <small>设为 0 会停止新增，但不会自动删除已有缓存。</small>
+              </label>
+            </div>
+          </details>
+
+          <div class="form-actions">
+            <button id="save-settings" class="button primary" type="submit">保存设置</button>
+            <span id="settings-message" class="inline-message" role="status" aria-live="polite"></span>
+          </div>
+        </form>
+      </section>
+
+      <section id="cache-panel" class="panel tab-panel" role="tabpanel" hidden>
+        <div class="panel-heading cache-heading">
+          <div>
+            <h2>图片缓存</h2>
+            <p id="cache-summary">正在读取缓存…</p>
+          </div>
+          <div class="toolbar">
+            <button id="refresh-cache" class="button subtle" type="button">刷新</button>
+            <button id="clear-cache" class="button danger" type="button">清空全部</button>
+          </div>
+        </div>
+
+        <div id="cache-message" class="banner" role="status" aria-live="polite" hidden></div>
+        <div id="gallery" class="gallery" aria-live="polite"></div>
+        <div id="empty-cache" class="empty-state" hidden>
+          <div class="empty-mark" aria-hidden="true">◇</div>
+          <h3>还没有缓存图片</h3>
+          <p>成功生成的图片会在发送到 QQ 前保存在这里。</p>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="preview-dialog" class="preview-dialog">
+      <div class="dialog-bar">
+        <div>
+          <p class="eyebrow">PREVIEW</p>
+          <h2 id="preview-title">图片预览</h2>
+        </div>
+        <button id="close-preview" class="icon-button" type="button" aria-label="关闭预览">×</button>
+      </div>
+      <div id="preview-stage" class="preview-stage">
+        <p id="preview-loading">正在载入大图预览…</p>
+        <img id="preview-image" alt="CanvasForge 生成图片预览" hidden />
+      </div>
+      <div class="dialog-actions">
+        <button id="preview-download" class="button primary" type="button">下载原图</button>
+      </div>
+    </dialog>
+
+    <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title">
+      <p class="eyebrow">CONFIRM</p>
+      <h2 id="confirm-title">确认操作</h2>
+      <p id="confirm-message"></p>
+      <div class="dialog-actions">
+        <button id="confirm-cancel" class="button subtle" type="button">取消</button>
+        <button id="confirm-accept" class="button danger" type="button">确认删除</button>
+      </div>
+    </dialog>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
