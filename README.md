@@ -6,7 +6,7 @@ CanvasForge 是面向 AstrBot + NapCat QQ 的图片生成插件。它通过 Sub2
 - 回复一条含图片的 QQ 消息后进行多图参考编辑；
 - AstrBot LLM Tool 自然语言调用；
 - `/canvasforge <提示词>` 命令调用；
-- 带高级设置和最近图片缓存的 AstrBot Plugin Page。
+- 带高级设置、最近图片缓存和版本更新入口的 AstrBot Plugin Page。
 
 ## 运行要求
 
@@ -72,6 +72,34 @@ NapCat `4.8.98` 已作为兼容样本；推荐使用 `4.18.13`。本插件不声
 - `revised_prompt` 或 usage。
 
 把缓存数量设为 `0` 会停止新增缓存，但不会自动删除已有图片。
+
+## 检查与安装更新
+
+CanvasForge 控制台会检查
+[`YuXya/astrbot_plugin_canvasforge`](https://github.com/YuXya/astrbot_plugin_canvasforge)
+的最新正式 GitHub Release。发现更高版本后，管理员可以在确认版本变化后执行更新；插件会委托 AstrBot 核心下载、校验并重载自身。
+
+- 仅识别 `vMAJOR.MINOR.PATCH` 格式的正式 Release，不安装 draft 或 prerelease；
+- 检查和安装会锁定同一个 Git Commit，不会在确认后改为安装变化后的 `main`；
+- 更新期间不会中断正在进行的付费生图；有生成任务时会直接拒绝本次更新；
+- 控制台不会读取或转发 Dashboard Token，也不接受页面传入的仓库、下载地址、代理或 Commit；
+- GitHub 连接失败时，请改用 AstrBot 插件管理中的“更新/重新安装”，并在那里选择需要的 GitHub 代理。
+
+页内更新使用 AstrBot `4.26.8` 当前仍兼容的内部插件更新能力，并会在接口不可用时停止操作、提示使用原生更新入口。AstrBot 核心更新不是完整的事务式安装：如果新代码覆盖后发生依赖或重载失败，可能仍需从插件管理按 GitHub 地址重新安装。
+
+CanvasForge 不保存历史更新包或旧版本备份。AstrBot 核心只复用一个固定名称的临时 ZIP，成功后删除；极端清理失败时，下一次更新也会覆盖同一路径，不会按版本无限累计。
+
+CanvasForge 自身不会记录下载地址、Commit、插件路径或响应正文。AstrBot `4.26.8` 的核心更新器仍可能按其原生行为在 AstrBot 日志中记录固定 GitHub 归档地址和插件安装路径；其中不含 Sub2API Key 或 Dashboard 凭据，插件也不会通过全局日志修改去掩盖上游日志。
+
+### 发布新版本
+
+1. 同步修改 `metadata.yaml` 的 `version` 和 `main.py` 的 `PLUGIN_VERSION`；
+2. 提交并推送同一份代码；
+3. 从该提交创建同名的 `vX.Y.Z` Tag；
+4. 使用该 Tag 创建正式 GitHub Release。
+
+只有推送分支或创建 Tag、但没有创建正式 Release 时，控制台不会把它识别为可安装的新版本。
+首个 `v0.1.0` 正式 Release 创建前会显示“仓库尚无正式 Release”；创建后会显示“已是最新版”，后续可从 `v0.1.1` 开始验证真实更新。
 
 ## 行为边界
 

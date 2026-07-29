@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+import contextvars
+from collections.abc import Awaitable, Mapping
+from pathlib import Path
 from typing import Any
 
 import aiohttp
+from astrbot import __version__ as ASTRBOT_VERSION
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 import astrbot.api.message_components as Comp
@@ -30,6 +33,7 @@ from .canvasforge.reference import (
     ReferenceResolver,
     build_source_metadata,
 )
+from .canvasforge.update import UpdateCoordinator
 from .canvasforge.web_api import WebAPI, normalize_settings
 
 
@@ -41,6 +45,7 @@ PLUGIN_DESCRIPTION = (
     "通过 Sub2API 调用 GPT Images，为 NapCat QQ 提供文生图与引用图编辑能力。"
 )
 MIB = 1024 * 1024
+_ADMISSION_CONTEXT_KEY = "_canvasforge_admission_runtime_v2"
 
 
 @register(
@@ -58,19 +63,34 @@ class CanvasForgePlugin(Star):
         self.config = config
         self._runtime_lock = asyncio.Lock()
         self._settings_lock = asyncio.Lock()
+        self._admission = self._get_admission_runtime(context)
         self._session: aiohttp.ClientSession | None = None
         self._provider_factory: ImageProviderFactory | None = None
         self._reference_resolver: ReferenceResolver | None = None
         self._request_gate = RequestGate()
 
-        cache_root = StarTools.get_data_dir(PLUGIN_NAME) / "cache"
+        data_root = StarTools.get_data_dir(PLUGIN_NAME)
+        cache_root = data_root / "cache"
         self._cache = CacheStore(cache_root)
         self._cache_ready = False
+        self._update_coordinator = UpdateCoordinator(
+            context,
+            data_root,
+            self._get_http_session,
+            Path(__file__).with_name("metadata.yaml"),
+            local_version=PLUGIN_VERSION,
+            astrbot_version=ASTRBOT_VERSION,
+            reserve_update=self._reserve_update,
+            release_update=self._release_update,
+        )
         self._web_api = WebAPI(
             context,
             self._cache,
             self._get_advanced_settings,
             self._save_advanced_settings,
+            self._begin_page_mutation,
+            self._end_page_mutation,
+            self._update_coordinator,
         )
         self._web_api.register()
 
@@ -78,6 +98,7 @@ class CanvasForgePlugin(Star):
         """Create long-lived resources without requiring a configured Key."""
 
         await self._ensure_runtime()
+        await self._update_coordinator.initialize()
         settings = await self._get_advanced_settings()
         try:
             await self._cache.initialize(settings["cache_max_images"])
@@ -172,6 +193,7 @@ class CanvasForgePlugin(Star):
     ) -> str:
         """Run one paid request and commit cooldown only after QQ delivery."""
 
+        await self._reject_if_updating()
         if event.get_platform_name() != "aiocqhttp":
             raise CanvasForgeError(ErrorCode.PLATFORM_UNSUPPORTED)
 
@@ -182,18 +204,18 @@ class CanvasForgePlugin(Star):
         )
         if not base_url or not api_key:
             raise CanvasForgeError(ErrorCode.NOT_CONFIGURED)
-        provider_factory, reference_resolver = await self._ensure_runtime()
 
         user_id = self._event_string(event, "get_sender_id")
         if not user_id:
             user_id = self._event_string(event, "get_session_id") or "unknown"
-        lease = await self._request_gate.acquire(
+        lease = await self._acquire_generation_lease(
             user_id,
             is_admin=bool(event.is_admin()),
             cooldown_seconds=settings["cooldown_seconds"],
         )
 
-        async with lease:
+        try:
+            provider_factory, reference_resolver = await self._ensure_runtime()
             # Bind URL and Key only after winning the non-queuing global gate.
             # This request-local provider cannot be changed by a concurrent
             # invocation or a Page configuration save.
@@ -260,6 +282,9 @@ class CanvasForgePlugin(Star):
                 lease,
             )
             return mode
+        finally:
+            if not lease.finished:
+                await lease.release()
 
     async def _send_generated_image_and_commit(
         self,
@@ -367,6 +392,15 @@ class CanvasForgePlugin(Star):
                     self._session,
                 )
             return self._provider_factory, self._reference_resolver
+
+    async def _get_http_session(self) -> aiohttp.ClientSession:
+        """Return the instance session used for public GitHub checks."""
+
+        await self._ensure_runtime()
+        session = self._session
+        if session is None or session.closed:
+            raise RuntimeError("CanvasForge HTTP session is unavailable")
+        return session
 
     async def _configuration_snapshot(
         self,
@@ -595,9 +629,164 @@ class CanvasForgePlugin(Star):
             return ""
         return str(value).strip() if value is not None else ""
 
+    @staticmethod
+    def _get_admission_runtime(context: Context) -> dict[str, Any]:
+        """Keep update admission state alive while this plugin reloads itself."""
+
+        current = getattr(context, _ADMISSION_CONTEXT_KEY, None)
+        if (
+            isinstance(current, dict)
+            and current.get("schema") == 2
+            and hasattr(current.get("lock"), "__aenter__")
+        ):
+            return current
+
+        runtime: dict[str, Any] = {
+            "schema": 2,
+            "lock": asyncio.Lock(),
+            "update_owner": None,
+            "page_mutations": 0,
+        }
+        setattr(context, _ADMISSION_CONTEXT_KEY, runtime)
+        return runtime
+
+    async def _acquire_generation_lease(
+        self,
+        user_id: str,
+        *,
+        is_admin: bool,
+        cooldown_seconds: float,
+    ) -> RequestLease:
+        """Acquire without leaking a busy slot across task cancellation."""
+
+        operation = self._reserve_generation_lease(
+            user_id,
+            is_admin=is_admin,
+            cooldown_seconds=cooldown_seconds,
+        )
+        task = contextvars.Context().run(asyncio.create_task, operation)
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+
+        try:
+            lease = task.result()
+        except BaseException:
+            if cancellation is not None:
+                raise cancellation from None
+            raise
+
+        if cancellation is not None:
+            await lease.release()
+            raise cancellation
+        return lease
+
+    async def _reject_if_updating(self) -> None:
+        """Give tools and commands the maintenance result before other checks."""
+
+        async with self._admission["lock"]:
+            if self._admission.get("update_owner") is not None:
+                raise CanvasForgeError(
+                    ErrorCode.BUSY,
+                    "CanvasForge 正在更新，请稍后再试。",
+                )
+
+    async def _reserve_generation_lease(
+        self,
+        user_id: str,
+        *,
+        is_admin: bool,
+        cooldown_seconds: float,
+    ) -> RequestLease:
+        """Atomically exclude a new paid request from a pending self-update."""
+
+        async with self._admission["lock"]:
+            if self._admission.get("update_owner") is not None:
+                raise CanvasForgeError(
+                    ErrorCode.BUSY,
+                    "CanvasForge 正在更新，请稍后再试。",
+                )
+            return await self._request_gate.acquire(
+                user_id,
+                is_admin=is_admin,
+                cooldown_seconds=cooldown_seconds,
+            )
+
+    async def _begin_page_mutation(self) -> bool:
+        """Reserve one Page write unless an update is already in progress."""
+
+        async with self._admission["lock"]:
+            if self._admission.get("update_owner") is not None:
+                return False
+            self._admission["page_mutations"] += 1
+            return True
+
+    async def _end_page_mutation(self) -> None:
+        async def decrement() -> None:
+            async with self._admission["lock"]:
+                self._admission["page_mutations"] = max(
+                    0,
+                    int(self._admission["page_mutations"]) - 1,
+                )
+
+        await self._finish_admission_cleanup(decrement())
+
+    async def _reserve_update(self, owner: str) -> bool:
+        """Atomically enter maintenance only while every writer is idle."""
+
+        if not isinstance(owner, str) or len(owner) != 32:
+            return False
+        async with self._admission["lock"]:
+            if self._admission.get("update_owner") is not None:
+                return False
+            if int(self._admission["page_mutations"]) > 0:
+                return False
+            if await self._request_gate.is_busy():
+                return False
+            self._admission["update_owner"] = owner
+            return True
+
+    async def _release_update(self, owner: str) -> None:
+        """Leave maintenance after the detached updater reaches a terminal state."""
+
+        async def release() -> None:
+            async with self._admission["lock"]:
+                if self._admission.get("update_owner") == owner:
+                    self._admission["update_owner"] = None
+
+        await self._finish_admission_cleanup(release())
+
+    @staticmethod
+    async def _finish_admission_cleanup(operation: Awaitable[None]) -> None:
+        """Finish state cleanup even when its request task is being cancelled."""
+
+        task = contextvars.Context().run(asyncio.create_task, operation)
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+        task.result()
+        if cancellation is not None:
+            raise cancellation
+
     async def terminate(self) -> None:
         """Close every long-lived network resource on plugin unload."""
 
+        self._web_api.deactivate()
+        try:
+            await self._update_coordinator.deactivate()
+        except Exception as exc:
+            logger.error(
+                "CanvasForge update coordinator shutdown failed (%s).",
+                type(exc).__name__,
+            )
         async with self._runtime_lock:
             session = self._session
             self._provider_factory = None

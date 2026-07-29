@@ -30,6 +30,9 @@ const numericSettingKeys = new Set([
   "cache_max_images",
 ]);
 
+const activeUpdatePhases = new Set(["accepted", "updating", "verifying"]);
+const terminalUpdatePhases = new Set(["succeeded", "failed", "interrupted"]);
+
 const state = {
   items: [],
   observer: null,
@@ -37,6 +40,22 @@ const state = {
   previewGeneration: 0,
   confirmResolve: null,
   cacheLoadGeneration: 0,
+  updateCheck: null,
+  updateCheckAttempted: false,
+  updateChecking: false,
+  updateApplying: false,
+  updateActive: false,
+  updatePhase: "idle",
+  updateTargetVersion: "",
+  updateExpectedJobId: "",
+  updateLastStatusJobId: "",
+  updateRecoveryBaselineJobId: "",
+  updateRecoveryStartedAt: 0,
+  updatePollGeneration: 0,
+  updatePollTimer: null,
+  updateTransientSince: 0,
+  updateObservedActive: false,
+  updateReloadScheduled: false,
 };
 
 function byId(id) {
@@ -61,6 +80,502 @@ function setCacheMessage(text, tone = "normal") {
   element.textContent = text;
   element.dataset.tone = tone;
   element.hidden = !text;
+}
+
+function setUpdateMessage(text, tone = "normal") {
+  const element = byId("update-status");
+  element.textContent = text;
+  element.dataset.tone = tone;
+}
+
+function setUpdateJobNote(text, tone = "normal") {
+  const element = byId("update-job-note");
+  element.textContent = text;
+  element.dataset.tone = tone;
+  element.hidden = !text;
+}
+
+function textValue(value, fallback = "") {
+  return typeof value === "string" && value.trim() ? value.trim() : fallback;
+}
+
+function withTimeout(promise, milliseconds, message) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = window.setTimeout(() => {
+      reject(new Error(message));
+    }, milliseconds);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer !== null) {
+      window.clearTimeout(timer);
+    }
+  });
+}
+
+function normalizeUpdatePayload(result) {
+  if (!result || typeof result !== "object") {
+    return {};
+  }
+  if (result.update && typeof result.update === "object") {
+    return { ...result, ...result.update };
+  }
+  if (result.job && typeof result.job === "object") {
+    return { ...result, ...result.job };
+  }
+  if (result.status && typeof result.status === "object") {
+    return { ...result, ...result.status };
+  }
+  return result;
+}
+
+function updatePhaseOf(payload) {
+  const phase = payload.state ?? payload.phase ?? payload.status;
+  return typeof phase === "string" ? phase.trim().toLowerCase() : "idle";
+}
+
+function updateCurrentVersion(payload) {
+  const version = textValue(
+    payload.current_version ?? payload.local_version ?? payload.plugin_version,
+  );
+  if (version) {
+    byId("current-version").textContent = version;
+  }
+}
+
+function showReleaseDetails(payload) {
+  const target = textValue(payload.target_version ?? payload.latest_version);
+  if (!target) {
+    byId("update-release").hidden = true;
+    return;
+  }
+  byId("target-version").textContent = target;
+  const releaseTitle = textValue(payload.release_title ?? payload.title);
+  if (releaseTitle || byId("update-release").hidden) {
+    byId("release-title").textContent = releaseTitle || "—";
+  }
+  const publishedAt = textValue(
+    payload.published_at ?? payload.release_published_at,
+  );
+  if (publishedAt || byId("update-release").hidden) {
+    byId("release-time").textContent = publishedAt ? formatTime(publishedAt) : "—";
+  }
+  byId("update-release").hidden = false;
+  state.updateTargetVersion = target;
+}
+
+function updateCanApply(check) {
+  return Boolean(
+    check
+      && textValue(check.check_id)
+      && check.can_apply !== false
+      && check.updater_available !== false
+      && check.update_supported !== false,
+  );
+}
+
+function renderUpdateControls() {
+  const checkButton = byId("check-update");
+  const applyButton = byId("apply-update");
+  checkButton.textContent = state.updateChecking
+    ? "检查中…"
+    : state.updateCheckAttempted
+      ? "再次检查"
+      : "检查更新";
+  checkButton.disabled = state.updateChecking || state.updateApplying || state.updateActive;
+
+  const showCompletedButton =
+    state.updatePhase === "succeeded" && state.updateReloadScheduled;
+  const showApplyButton =
+    state.updateActive
+    || state.updateApplying
+    || Boolean(state.updateCheck)
+    || showCompletedButton;
+  applyButton.hidden = !showApplyButton;
+
+  if (showCompletedButton) {
+    applyButton.textContent = "更新完成，正在刷新…";
+  } else if (state.updateApplying) {
+    applyButton.textContent = "正在更新…";
+  } else if (state.updateActive) {
+    applyButton.textContent = "正在更新…";
+  } else {
+    applyButton.textContent = state.updateTargetVersion
+      ? `更新到 ${state.updateTargetVersion}`
+      : "安装更新";
+  }
+  applyButton.disabled =
+    state.updateApplying
+    || state.updateActive
+    || showCompletedButton
+    || !updateCanApply(state.updateCheck);
+}
+
+function updateStatusMessage(phase, payload) {
+  const serverMessage = textValue(payload.message);
+  if (phase === "accepted") {
+    return serverMessage || "更新任务已受理，正在准备…";
+  }
+  if (phase === "updating") {
+    return serverMessage || "正在更新插件，控制台可能会短暂断开…";
+  }
+  if (phase === "verifying") {
+    return serverMessage || "代码已更新，正在验证插件重载结果…";
+  }
+  return serverMessage;
+}
+
+function scheduleUpdateReload() {
+  if (state.updateReloadScheduled) {
+    return;
+  }
+  state.updateReloadScheduled = true;
+  renderUpdateControls();
+  window.setTimeout(() => {
+    window.location.reload();
+  }, 1200);
+}
+
+function renderUpdateJob(result, { observed = false } = {}) {
+  const payload = normalizeUpdatePayload(result);
+  const phase = updatePhaseOf(payload);
+  state.updateLastStatusJobId = textValue(payload.job_id);
+  updateCurrentVersion(payload);
+  if (textValue(payload.target_version ?? payload.latest_version)) {
+    showReleaseDetails(payload);
+  }
+  state.updatePhase = phase;
+
+  if (activeUpdatePhases.has(phase)) {
+    state.updateActive = true;
+    state.updateObservedActive = true;
+    state.updateTransientSince = 0;
+    setUpdateJobNote("");
+    setUpdateMessage(updateStatusMessage(phase, payload));
+    renderUpdateControls();
+    return true;
+  }
+
+  state.updateActive = false;
+  if (phase === "succeeded") {
+    const message = textValue(payload.message, "上次更新已成功完成。");
+    if (observed || state.updateObservedActive) {
+      setUpdateJobNote("");
+      setUpdateMessage("更新完成，正在刷新…", "success");
+      scheduleUpdateReload();
+    } else {
+      setUpdateJobNote(message, "success");
+    }
+  } else if (phase === "failed") {
+    if (observed || state.updateObservedActive) {
+      setUpdateMessage("更新失败。", "error");
+    }
+    setUpdateJobNote(
+      textValue(
+        payload.message,
+        "上次更新失败；如插件无法正常使用，请从 AstrBot 插件管理按 GitHub 地址重新安装。",
+      ),
+      "error",
+    );
+  } else if (phase === "interrupted") {
+    if (observed || state.updateObservedActive) {
+      setUpdateMessage("更新已中断。", "error");
+    }
+    setUpdateJobNote(
+      textValue(
+        payload.message,
+        "上次更新被中断，暂时无法确认结果；请重新检查版本。",
+      ),
+      "error",
+    );
+  } else if (terminalUpdatePhases.has(phase)) {
+    setUpdateJobNote(textValue(payload.message, "更新任务已结束。"));
+  }
+  renderUpdateControls();
+  return false;
+}
+
+function stopUpdatePolling() {
+  state.updatePollGeneration += 1;
+  state.updateTransientSince = 0;
+  if (state.updatePollTimer !== null) {
+    window.clearTimeout(state.updatePollTimer);
+    state.updatePollTimer = null;
+  }
+}
+
+function startUpdatePolling({
+  checkAfterRecovery = false,
+  requireNewJob = false,
+} = {}) {
+  stopUpdatePolling();
+  const generation = state.updatePollGeneration;
+
+  const poll = async () => {
+    if (generation !== state.updatePollGeneration) {
+      return;
+    }
+    if (!state.updateTransientSince) {
+      state.updateTransientSince = Date.now();
+    }
+    const remainingWatchdog = Math.max(
+      0,
+      90_000 - (Date.now() - state.updateTransientSince),
+    );
+    const requestWatchdog = window.setTimeout(() => {
+      if (generation === state.updatePollGeneration) {
+        setUpdateMessage(
+          "暂时无法确认更新结果，请稍后重新打开控制台检查。",
+        );
+      }
+    }, remainingWatchdog);
+    try {
+      const result = await bridge.apiGet("update/status");
+      if (generation !== state.updatePollGeneration) {
+        return;
+      }
+      const payload = normalizeUpdatePayload(result);
+      const phase = updatePhaseOf(payload);
+      const jobId = textValue(payload.job_id);
+      if (state.updateExpectedJobId) {
+        if (jobId !== state.updateExpectedJobId) {
+          throw new Error("返回的更新任务与已受理任务不一致。");
+        }
+      } else if (requireNewJob) {
+        if (!jobId || jobId === state.updateRecoveryBaselineJobId) {
+          if (
+            state.updateRecoveryStartedAt
+            && Date.now() - state.updateRecoveryStartedAt < 30_000
+          ) {
+            throw new Error("更新任务尚未出现在状态接口中。");
+          }
+          stopUpdatePolling();
+          state.updateActive = false;
+          state.updateObservedActive = false;
+          state.updatePhase = "idle";
+          setUpdateMessage(
+            "未确认到新的更新任务，正在重新检查版本…",
+          );
+          renderUpdateControls();
+          if (checkAfterRecovery) {
+            await checkForUpdates(false);
+          }
+          return;
+        }
+        state.updateExpectedJobId = jobId;
+        state.updateRecoveryStartedAt = 0;
+      }
+      state.updateTransientSince = 0;
+      const stillActive = renderUpdateJob(payload, {
+        observed:
+          Boolean(state.updateExpectedJobId)
+          || activeUpdatePhases.has(phase),
+      });
+      if (!stillActive) {
+        state.updateExpectedJobId = "";
+        state.updateRecoveryStartedAt = 0;
+        stopUpdatePolling();
+        if (checkAfterRecovery && !state.updateReloadScheduled) {
+          await checkForUpdates(false);
+        }
+        return;
+      }
+    } catch (error) {
+      if (generation !== state.updatePollGeneration) {
+        return;
+      }
+      if (!state.updateTransientSince) {
+        state.updateTransientSince = Date.now();
+      }
+      if (Date.now() - state.updateTransientSince >= 90_000) {
+        setUpdateMessage(
+          "暂时无法确认更新结果，请稍后重新打开控制台检查。",
+        );
+      }
+    } finally {
+      window.clearTimeout(requestWatchdog);
+    }
+    if (generation === state.updatePollGeneration) {
+      state.updatePollTimer = window.setTimeout(poll, 2000);
+    }
+  };
+
+  state.updatePollTimer = window.setTimeout(poll, 2000);
+}
+
+function checkResultMessage(status, payload) {
+  const serverMessage = textValue(payload.message);
+  if (serverMessage) {
+    return serverMessage;
+  }
+  if (status === "no_release") {
+    return "仓库还没有正式 Release，当前版本不会自动变更。";
+  }
+  if (status === "up_to_date") {
+    return "已是最新版。";
+  }
+  if (status === "ahead") {
+    return "当前版本高于仓库最新正式 Release。";
+  }
+  if (status === "incompatible") {
+    const requiredVersion = textValue(payload.required_astrbot_version);
+    return requiredVersion
+      ? `发现新版本，但需要 AstrBot ${requiredVersion}。`
+      : "发现新版本，但当前 AstrBot 版本不满足更新要求。";
+  }
+  if (status === "update_available") {
+    return "发现可用更新。";
+  }
+  return "更新检查已完成。";
+}
+
+async function checkForUpdates(force = false) {
+  if (state.updateChecking || state.updateApplying || state.updateActive) {
+    return;
+  }
+  state.updateChecking = true;
+  state.updateCheckAttempted = true;
+  setUpdateMessage("正在检查更新…");
+  renderUpdateControls();
+  try {
+    const result = await bridge.apiGet("update/check", force ? { force: 1 } : {});
+    const payload = normalizeUpdatePayload(result);
+    const status = updatePhaseOf(payload);
+    updateCurrentVersion(payload);
+    state.updateCheck = null;
+    state.updateTargetVersion = "";
+
+    if (status === "update_available") {
+      showReleaseDetails(payload);
+      const canApply = updateCanApply(payload);
+      state.updateCheck = canApply ? payload : null;
+      setUpdateMessage(
+        canApply
+          ? checkResultMessage(status, payload) || "发现可用更新。"
+          : textValue(
+              payload.unavailable_reason ?? payload.update_message ?? payload.message,
+              "发现新版本，但页内更新不可用；请使用 AstrBot 插件管理更新。",
+            ),
+        canApply ? "success" : "error",
+      );
+    } else {
+      if (
+        status === "incompatible"
+        && textValue(payload.target_version ?? payload.latest_version)
+      ) {
+        showReleaseDetails(payload);
+      } else {
+        byId("update-release").hidden = true;
+      }
+      setUpdateMessage(
+        checkResultMessage(status, payload),
+        status === "incompatible" ? "error" : status === "up_to_date" ? "success" : "normal",
+      );
+    }
+  } catch (error) {
+    setUpdateMessage(messageOf(error), "error");
+  } finally {
+    state.updateChecking = false;
+    renderUpdateControls();
+  }
+}
+
+async function applyAvailableUpdate() {
+  const check = state.updateCheck;
+  if (!updateCanApply(check) || state.updateApplying || state.updateActive) {
+    return;
+  }
+  const currentVersion = byId("current-version").textContent.trim() || "当前版本";
+  const targetVersion = state.updateTargetVersion || "新版本";
+  const confirmed = await requestConfirmation({
+    title: "确认更新 CanvasForge",
+    message:
+      `即将从 ${currentVersion} 更新到 ${targetVersion}。\n\n`
+      + "来源：GitHub · YuXya/astrbot_plugin_canvasforge\n"
+      + "更新期间插件会短暂重载，控制台可能暂时断开。\n"
+      + "如果更新失败，可能需要从 AstrBot 插件管理按 GitHub 地址重新安装。\n"
+      + "请勿同时从 AstrBot 原生更新入口执行更新。",
+    acceptText: `更新到 ${targetVersion}`,
+    tone: "primary",
+  });
+  if (!confirmed) {
+    return;
+  }
+
+  state.updateApplying = true;
+  const recoveryBaselineJobId = state.updateLastStatusJobId;
+  setUpdateJobNote("");
+  setUpdateMessage("正在提交更新任务…");
+  renderUpdateControls();
+  try {
+    const result = await withTimeout(
+      bridge.apiPost("update/apply", {
+        check_id: check.check_id,
+      }),
+      15_000,
+      "更新提交响应超时。",
+    );
+    const payload = normalizeUpdatePayload(result);
+    if (payload.accepted !== true || !textValue(payload.job_id)) {
+      throw new Error("更新任务响应异常，尚未确认任务已受理。");
+    }
+    state.updateCheck = null;
+    state.updateApplying = false;
+    state.updateActive = true;
+    state.updateObservedActive = true;
+    state.updateExpectedJobId = textValue(payload.job_id);
+    state.updateRecoveryBaselineJobId = "";
+    state.updateRecoveryStartedAt = 0;
+    state.updatePhase = updatePhaseOf(payload) || "accepted";
+    if (!activeUpdatePhases.has(state.updatePhase)) {
+      state.updatePhase = "accepted";
+    }
+    state.updateTargetVersion = textValue(
+      payload.target_version,
+      state.updateTargetVersion,
+    );
+    setUpdateMessage(updateStatusMessage(state.updatePhase, payload));
+    renderUpdateControls();
+    startUpdatePolling();
+  } catch (error) {
+    state.updateApplying = false;
+    state.updateCheck = null;
+    state.updateActive = true;
+    state.updateObservedActive = false;
+    state.updateExpectedJobId = "";
+    state.updateRecoveryBaselineJobId = recoveryBaselineJobId;
+    state.updateRecoveryStartedAt = Date.now();
+    state.updatePhase = "accepted";
+    setUpdateMessage(`${messageOf(error)} 正在确认更新任务状态…`, "error");
+    renderUpdateControls();
+    startUpdatePolling({
+      checkAfterRecovery: true,
+      requireNewJob: true,
+    });
+  }
+}
+
+async function initializeUpdates() {
+  let active = false;
+  try {
+    const result = await bridge.apiGet("update/status");
+    active = renderUpdateJob(result);
+  } catch (error) {
+    state.updateActive = true;
+    state.updateObservedActive = false;
+    state.updateExpectedJobId = "";
+    state.updateRecoveryBaselineJobId = "";
+    state.updateRecoveryStartedAt = 0;
+    setUpdateJobNote("");
+    setUpdateMessage("控制台暂时无法读取更新状态，正在尝试恢复连接…");
+    startUpdatePolling({ checkAfterRecovery: true });
+    return;
+  }
+  if (active) {
+    startUpdatePolling();
+    return;
+  }
+  await checkForUpdates(false);
 }
 
 function setButtonBusy(button, busy, busyText) {
@@ -411,14 +926,27 @@ function resolveConfirmation(confirmed) {
   }
 }
 
-function requestConfirmation(message) {
+function requestConfirmation({
+  title = "确认操作",
+  message,
+  acceptText = "确认",
+  tone = "danger",
+}) {
   if (state.confirmResolve) {
     resolveConfirmation(false);
   }
+  byId("confirm-title").textContent = title;
   byId("confirm-message").textContent = message;
-  byId("confirm-dialog").showModal();
+  const accept = byId("confirm-accept");
+  accept.textContent = acceptText;
+  accept.classList.toggle("primary", tone === "primary");
+  accept.classList.toggle("danger", tone !== "primary");
   return new Promise((resolve) => {
     state.confirmResolve = resolve;
+    byId("confirm-dialog").showModal();
+    window.requestAnimationFrame(() => {
+      byId("confirm-cancel").focus();
+    });
   });
 }
 
@@ -435,7 +963,14 @@ async function downloadItem(item, button) {
 }
 
 async function deleteItem(item, button) {
-  if (!(await requestConfirmation("确定删除这张缓存图片吗？删除后无法恢复。"))) {
+  if (
+    !(await requestConfirmation({
+      title: "删除缓存图片",
+      message: "确定删除这张缓存图片吗？删除后无法恢复。",
+      acceptText: "确认删除",
+      tone: "danger",
+    }))
+  ) {
     return;
   }
   setButtonBusy(button, true, "删除中…");
@@ -462,9 +997,12 @@ async function clearCache() {
     return;
   }
   if (
-    !(await requestConfirmation(
-      `确定清空全部 ${state.items.length} 张缓存图片吗？此操作无法恢复。`,
-    ))
+    !(await requestConfirmation({
+      title: "清空图片缓存",
+      message: `确定清空全部 ${state.items.length} 张缓存图片吗？此操作无法恢复。`,
+      acceptText: "确认清空",
+      tone: "danger",
+    }))
   ) {
     return;
   }
@@ -490,6 +1028,10 @@ function wireEvents() {
   for (const button of document.querySelectorAll(".tab")) {
     button.addEventListener("click", () => activateTab(button.dataset.tab));
   }
+  byId("check-update").addEventListener("click", () => {
+    checkForUpdates(true);
+  });
+  byId("apply-update").addEventListener("click", applyAvailableUpdate);
   byId("settings-form").addEventListener("submit", saveSettings);
   byId("output_format").addEventListener("change", syncCompressionState);
   byId("refresh-cache").addEventListener("click", loadCache);
@@ -520,6 +1062,7 @@ function wireEvents() {
       resolveConfirmation(false);
     }
   });
+  window.addEventListener("pagehide", stopUpdatePolling, { once: true });
 }
 
 async function initialize() {
@@ -530,7 +1073,7 @@ async function initialize() {
   }
   try {
     await bridge.ready();
-    await Promise.all([loadSettings(), loadCache()]);
+    await Promise.all([loadSettings(), loadCache(), initializeUpdates()]);
   } catch (error) {
     setInlineMessage(messageOf(error), "error");
   }
