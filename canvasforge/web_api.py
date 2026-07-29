@@ -50,6 +50,7 @@ ADVANCED_DEFAULTS: dict[str, Any] = {
     "output_compression": 90,
     "request_timeout_seconds": 300,
     "cooldown_seconds": 300,
+    "admin_only_generation": True,
     "max_prompt_chars": 8000,
     "max_output_mib": 20,
     "enable_avatar_references": True,
@@ -111,9 +112,9 @@ def _validate_setting(key: str, value: Any) -> Any:
         if value not in {"png", "jpeg", "webp"}:
             raise ValueError("输出格式选项无效")
         return value
-    if key == "enable_avatar_references":
+    if key in {"admin_only_generation", "enable_avatar_references"}:
         if not isinstance(value, bool):
-            raise ValueError("头像参考开关必须是布尔值")
+            raise ValueError("功能开关必须是布尔值")
         return value
 
     ranges = {

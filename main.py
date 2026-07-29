@@ -43,7 +43,7 @@ from .canvasforge.web_api import WebAPI, normalize_settings
 
 PLUGIN_NAME = "astrbot_plugin_canvasforge"
 PLUGIN_AUTHOR = "YuXya"
-PLUGIN_VERSION = "v0.1.4"
+PLUGIN_VERSION = "v0.1.5"
 PLUGIN_REPOSITORY = "https://github.com/YuXya/astrbot_plugin_canvasforge"
 PLUGIN_DESCRIPTION = (
     "通过 Sub2API 调用 GPT Images，为 NapCat QQ 提供文生图与引用图编辑能力。"
@@ -292,6 +292,9 @@ class CanvasForgePlugin(Star):
             raise CanvasForgeError(ErrorCode.PLATFORM_UNSUPPORTED)
 
         base_url, api_key, settings = await self._configuration_snapshot()
+        is_admin = bool(event.is_admin())
+        if settings["admin_only_generation"] and not is_admin:
+            raise CanvasForgeError(ErrorCode.ADMIN_ONLY)
         normalized_prompt = self._validate_prompt(
             prompt,
             settings["max_prompt_chars"],
@@ -304,7 +307,7 @@ class CanvasForgePlugin(Star):
             user_id = self._event_string(event, "get_session_id") or "unknown"
         lease = await self._acquire_generation_lease(
             user_id,
-            is_admin=bool(event.is_admin()),
+            is_admin=is_admin,
             cooldown_seconds=settings["cooldown_seconds"],
         )
 

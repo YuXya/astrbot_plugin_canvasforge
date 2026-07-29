@@ -53,6 +53,11 @@
         "type": "int",
         "default": 300
       },
+      "admin_only_generation": {
+        "description": "仅允许 AstrBot 管理员使用 CanvasForge 生图功能",
+        "type": "bool",
+        "default": true
+      },
       "max_prompt_chars": {
         "description": "提示词字符上限",
         "type": "int",

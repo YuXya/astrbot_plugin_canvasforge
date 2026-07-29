@@ -8,6 +8,7 @@ const settingKeys = [
   "output_compression",
   "request_timeout_seconds",
   "cooldown_seconds",
+  "admin_only_generation",
   "max_prompt_chars",
   "max_output_mib",
   "enable_avatar_references",
@@ -31,7 +32,10 @@ const numericSettingKeys = new Set([
   "cache_max_images",
 ]);
 
-const booleanSettingKeys = new Set(["enable_avatar_references"]);
+const booleanSettingKeys = new Set([
+  "admin_only_generation",
+  "enable_avatar_references",
+]);
 
 const activeUpdatePhases = new Set(["accepted", "updating", "verifying"]);
 const terminalUpdatePhases = new Set(["succeeded", "failed", "interrupted"]);
@@ -702,6 +706,36 @@ function formatTime(value) {
   }).format(date);
 }
 
+function cacheModeInfo(value) {
+  const mode = String(value || "").trim().toLowerCase();
+  if (mode === "generate") {
+    return {
+      key: "generate",
+      label: "文生图",
+      detail: "文生图（generations）",
+    };
+  }
+  if (mode === "edit") {
+    return {
+      key: "edit",
+      label: "图生图",
+      detail: "图生图（edits）",
+    };
+  }
+  if (mode === "recovered") {
+    return {
+      key: "unknown",
+      label: "模式未知",
+      detail: "恢复缓存，未记录生成方式",
+    };
+  }
+  return {
+    key: "unknown",
+    label: "模式未知",
+    detail: "旧缓存未记录生成方式",
+  };
+}
+
 function labelValue(label, value) {
   const row = document.createElement("div");
   row.className = "meta-row";
@@ -727,7 +761,7 @@ function renderCacheSummary() {
     return;
   }
   if (!state.cacheLoaded) {
-    summary.textContent = "尚未读取缓存。";
+    summary.textContent = "尚未读取缓存；生成新图后请点击“刷新缓存”查看最新模式。";
     return;
   }
   summary.textContent =
@@ -762,11 +796,15 @@ function createCard(item) {
   const article = document.createElement("article");
   article.className = "cache-card";
   article.dataset.cacheId = item.id;
+  const modeInfo = cacheModeInfo(item.mode);
 
   const previewButton = document.createElement("button");
   previewButton.className = "image-button";
   previewButton.type = "button";
-  previewButton.setAttribute("aria-label", `预览 ${formatTime(item.created_at)} 生成的图片`);
+  previewButton.setAttribute(
+    "aria-label",
+    `预览 ${formatTime(item.created_at)} 生成的${modeInfo.label}图片`,
+  );
   previewButton.addEventListener("click", () => openPreview(item));
 
   const image = document.createElement("img");
@@ -776,14 +814,18 @@ function createCard(item) {
   const placeholder = document.createElement("span");
   placeholder.className = "image-placeholder";
   placeholder.textContent = "载入缩略图";
-  previewButton.append(image, placeholder);
+  const modeBadge = document.createElement("span");
+  modeBadge.className = "cache-mode-badge";
+  modeBadge.dataset.mode = modeInfo.key;
+  modeBadge.textContent = modeInfo.label;
+  previewButton.append(image, placeholder, modeBadge);
 
   const body = document.createElement("div");
   body.className = "card-body";
   const heading = document.createElement("div");
   heading.className = "card-heading";
   const title = document.createElement("h3");
-  title.textContent = item.mode === "edit" ? "引用图编辑" : item.mode === "recovered" ? "恢复的缓存" : "文本生图";
+  title.textContent = modeInfo.label;
   const time = document.createElement("time");
   time.dateTime = item.created_at || "";
   time.textContent = formatTime(item.created_at);
@@ -793,6 +835,7 @@ function createCard(item) {
   metadata.className = "metadata";
   const dimensions = item.size || (item.width && item.height ? `${item.width}×${item.height}` : "");
   metadata.append(
+    labelValue("生成方式", modeInfo.detail),
     labelValue("模型", item.model),
     labelValue("规格", `${dimensions || "尺寸未知"} · ${String(item.format || "未知").toUpperCase()} · ${humanBytes(item.file_size)}`),
     labelValue("用户", item.user_name ? `${item.user_name} (${item.user_id || "ID 未知"})` : item.user_id),
@@ -930,7 +973,8 @@ async function openPreview(item) {
   const loading = byId("preview-loading");
   const generation = ++state.previewGeneration;
   state.previewItem = item;
-  byId("preview-title").textContent = `${item.mode === "edit" ? "引用图编辑" : "文本生图"} · ${formatTime(item.created_at)}`;
+  const modeInfo = cacheModeInfo(item.mode);
+  byId("preview-title").textContent = `${modeInfo.label} · ${formatTime(item.created_at)}`;
   image.hidden = true;
   image.removeAttribute("src");
   loading.hidden = false;

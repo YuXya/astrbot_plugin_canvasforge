@@ -137,6 +137,18 @@
                 <span>用户冷却（秒）</span>
                 <input id="cooldown_seconds" name="cooldown_seconds" type="number" min="0" max="86400" step="1" />
               </label>
+              <label class="toggle-field field-wide" for="admin_only_generation">
+                <input
+                  id="admin_only_generation"
+                  name="admin_only_generation"
+                  type="checkbox"
+                  checked
+                />
+                <span class="toggle-copy">
+                  <strong>仅允许 AstrBot 管理员使用 CanvasForge</strong>
+                  <small>默认开启；同时限制两个 LLM 生图工具和 /canvasforge 命令。关闭后普通用户仍受全局单任务与用户冷却限制。</small>
+                </span>
+              </label>
               <label class="field">
                 <span>提示词长度上限</span>
                 <input id="max_prompt_chars" name="max_prompt_chars" type="number" min="1" max="50000" step="1" />
@@ -208,7 +220,7 @@
         <div class="panel-heading cache-heading">
           <div>
             <h2>图片缓存</h2>
-            <p id="cache-summary">尚未读取缓存。</p>
+            <p id="cache-summary">尚未读取缓存；生成新图后请点击“刷新缓存”查看最新模式。</p>
           </div>
           <div class="toolbar">
             <button id="refresh-cache" class="button subtle" type="button">刷新缓存</button>

@@ -16,6 +16,7 @@ class ErrorCode(str, Enum):
     AVATAR_TARGET_INVALID = "avatar_target_invalid"
     AVATAR_UNAVAILABLE = "avatar_unavailable"
     PLATFORM_UNSUPPORTED = "platform_unsupported"
+    ADMIN_ONLY = "admin_only"
     NOT_CONFIGURED = "not_configured"
     CONFIG_INVALID = "config_invalid"
     MISSING_PROMPT = "missing_prompt"
@@ -40,6 +41,7 @@ _DEFAULT_MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.AVATAR_TARGET_INVALID: "人物头像选择器无效、重复或不适用于当前会话。",
     ErrorCode.AVATAR_UNAVAILABLE: "人物头像暂时无法获取或图片无效，请稍后重试。",
     ErrorCode.PLATFORM_UNSUPPORTED: "CanvasForge 当前仅支持 NapCat（aiocqhttp）平台。",
+    ErrorCode.ADMIN_ONLY: "CanvasForge 当前仅允许 AstrBot 管理员使用。",
     ErrorCode.NOT_CONFIGURED: "CanvasForge 尚未配置图片服务站点或 Key。",
     ErrorCode.CONFIG_INVALID: "CanvasForge 的图片服务配置无效，请联系管理员检查。",
     ErrorCode.MISSING_PROMPT: "请提供要生成或编辑的图片描述。",

@@ -672,7 +672,7 @@ class CacheStore:
         return {
             "id": cache_id,
             "created_at": created_at,
-            "mode": self._bounded_string(metadata.get("mode"), "generate"),
+            "mode": self._normalize_mode(metadata.get("mode")),
             "model": self._bounded_string(metadata.get("model"), "unknown"),
             "size": self._bounded_string(metadata.get("size"), f"{width}x{height}"),
             "width": width,
@@ -718,7 +718,7 @@ class CacheStore:
         entry = {
             "id": cache_id,
             "created_at": self._bounded_string(raw.get("created_at"), ""),
-            "mode": self._bounded_string(raw.get("mode"), "generate"),
+            "mode": self._normalize_mode(raw.get("mode")),
             "model": self._bounded_string(raw.get("model"), "unknown"),
             "size": self._bounded_string(raw.get("size"), ""),
             "width": self._safe_int(raw.get("width")),
@@ -936,6 +936,21 @@ class CacheStore:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+
+    @classmethod
+    def _normalize_mode(cls, value: Any) -> str:
+        normalized = cls._bounded_string(value, "").strip().lower()
+        return {
+            "generate": "generate",
+            "generation": "generate",
+            "text_to_image": "generate",
+            "text-to-image": "generate",
+            "edit": "edit",
+            "edits": "edit",
+            "image_to_image": "edit",
+            "image-to-image": "edit",
+            "recovered": "recovered",
+        }.get(normalized, "unknown")
 
     @staticmethod
     def _bounded_string(value: Any, default: str) -> str:

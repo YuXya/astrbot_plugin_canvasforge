@@ -2,7 +2,7 @@ name: astrbot_plugin_canvasforge
 display_name: CanvasForge
 desc: 通过 Sub2API 调用 GPT Images，为 NapCat QQ 提供文生图与引用图编辑能力。
 help: 使用自然语言让 AI 选择 canvasforge_text_to_image 或 canvasforge_image_to_image，或发送 /canvasforge <提示词>。
-version: v0.1.4
+version: v0.1.5
 author: YuXya
 repo: https://github.com/YuXya/astrbot_plugin_canvasforge
 license: AGPL-3.0

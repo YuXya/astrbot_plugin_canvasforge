@@ -590,6 +590,40 @@ input:disabled {
   font-size: 0.78rem;
 }
 
+.cache-mode-badge {
+  position: absolute;
+  z-index: 2;
+  top: 12px;
+  left: 12px;
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 4px 10px;
+  border: 1px solid currentcolor;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+  box-shadow: 0 6px 20px rgb(0 0 0 / 14%);
+  backdrop-filter: blur(10px);
+}
+
+.cache-mode-badge[data-mode="generate"] {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent-soft) 92%, transparent);
+}
+
+.cache-mode-badge[data-mode="edit"] {
+  color: var(--success);
+  background: color-mix(in srgb, var(--success-soft) 92%, transparent);
+}
+
+.cache-mode-badge[data-mode="unknown"] {
+  color: var(--muted);
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+}
+
 .card-body {
   padding: 15px;
 }
@@ -615,7 +649,7 @@ input:disabled {
 
 .meta-row {
   display: grid;
-  grid-template-columns: 42px minmax(0, 1fr);
+  grid-template-columns: 58px minmax(0, 1fr);
   gap: 8px;
   font-size: 0.75rem;
 }
