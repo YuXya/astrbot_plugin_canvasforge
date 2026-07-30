@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol, Sequence, runtime_checkable
 
@@ -46,7 +46,10 @@ _DEFAULT_MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.CONFIG_INVALID: "CanvasForge 的图片服务配置无效，请联系管理员检查。",
     ErrorCode.MISSING_PROMPT: "请提供要生成或编辑的图片描述。",
     ErrorCode.MODE_MISMATCH: "当前请求与所选生图工具不匹配，请选择正确的工具后重试。",
-    ErrorCode.BUSY: "CanvasForge 正在处理另一张图片，请稍后再试。",
+    ErrorCode.BUSY: (
+        "CanvasForge 一次只能处理一个生图任务；"
+        "请等待当前任务完成后再试。"
+    ),
     ErrorCode.COOLDOWN: "生成冷却尚未结束，请稍后再试。",
     ErrorCode.AUTH: "图片服务鉴权失败，请管理员检查站点和 Key。",
     ErrorCode.RATE_LIMIT: "图片服务当前限流，请稍后再试。",
@@ -124,7 +127,7 @@ class HttpKeyProviderConfig:
     """Provider connection values supported by CanvasForge v0.1."""
 
     base_url: str
-    api_key: str
+    api_key: str = field(repr=False)
 
 
 @runtime_checkable

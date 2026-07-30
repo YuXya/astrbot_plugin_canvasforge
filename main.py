@@ -6,12 +6,13 @@ import asyncio
 import copy
 import contextvars
 import json
-from collections.abc import Awaitable, Mapping
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import aiohttp
-from astrbot import __version__ as ASTRBOT_VERSION
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 import astrbot.api.message_components as Comp
@@ -37,25 +38,47 @@ from .canvasforge.reference import (
     ReferenceResolver,
     build_source_metadata,
 )
-from .canvasforge.update import UpdateCoordinator
 from .canvasforge.web_api import WebAPI, normalize_settings
 
 
 PLUGIN_NAME = "astrbot_plugin_canvasforge"
 PLUGIN_AUTHOR = "YuXya"
-PLUGIN_VERSION = "v0.1.6"
+PLUGIN_VERSION = "v0.1.7"
 PLUGIN_REPOSITORY = "https://github.com/YuXya/astrbot_plugin_canvasforge"
 PLUGIN_DESCRIPTION = (
     "通过 Sub2API 调用 GPT Images，为 NapCat QQ 提供文生图与引用图编辑能力。"
 )
 MIB = 1024 * 1024
-_ADMISSION_CONTEXT_KEY = "_canvasforge_admission_runtime_v2"
+_LEGACY_UPDATE_CONTEXT_KEY = "_canvasforge_update_runtime_v1"
+_LEGACY_ADMISSION_CONTEXT_KEY = "_canvasforge_admission_runtime_v2"
+_LEGACY_UPDATE_STATUS_FILENAMES = (
+    "update-status.json",
+    "update-status.json.tmp",
+)
 _TEXT_TO_IMAGE_TOOL_NAME = "canvasforge_text_to_image"
 _IMAGE_TO_IMAGE_TOOL_NAME = "canvasforge_image_to_image"
 _LLM_TOOL_NAMES = (
     _TEXT_TO_IMAGE_TOOL_NAME,
     _IMAGE_TO_IMAGE_TOOL_NAME,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _GenerationJob:
+    """One immutable, leased background request.
+
+    User content, connection settings, the event and the lease are excluded
+    from ``repr`` so diagnostics cannot accidentally disclose them.
+    """
+
+    event: AstrMessageEvent = field(repr=False)
+    prompt: str = field(repr=False)
+    requested_mode: str | None
+    avatar_targets: tuple[str, ...] | None = field(repr=False)
+    base_url: str = field(repr=False)
+    api_key: str = field(repr=False)
+    settings: Mapping[str, Any] = field(repr=False)
+    lease: RequestLease = field(repr=False)
 
 
 @register(
@@ -73,7 +96,16 @@ class CanvasForgePlugin(Star):
         self.config = config
         self._runtime_lock = asyncio.Lock()
         self._settings_lock = asyncio.Lock()
-        self._admission = self._get_admission_runtime(context)
+        self._lifecycle_lock = asyncio.Lock()
+        self._closing = False
+        self._generation_tasks: set[asyncio.Task[None]] = set()
+        self._generation_leases: dict[
+            asyncio.Task[None],
+            RequestLease,
+        ] = {}
+        self._lease_cleanup_tasks: set[asyncio.Task[None]] = set()
+        self._termination_task: asyncio.Task[None] | None = None
+        self._legacy_cleanup_task: asyncio.Task[None] | None = None
         self._session: aiohttp.ClientSession | None = None
         self._provider_factory: ImageProviderFactory | None = None
         self._reference_resolver: ReferenceResolver | None = None
@@ -81,27 +113,15 @@ class CanvasForgePlugin(Star):
         self._request_gate = RequestGate()
 
         data_root = StarTools.get_data_dir(PLUGIN_NAME)
+        self._data_root = data_root
         cache_root = data_root / "cache"
         self._cache = CacheStore(cache_root)
         self._cache_ready = False
-        self._update_coordinator = UpdateCoordinator(
-            context,
-            data_root,
-            self._get_http_session,
-            Path(__file__).with_name("metadata.yaml"),
-            local_version=PLUGIN_VERSION,
-            astrbot_version=ASTRBOT_VERSION,
-            reserve_update=self._reserve_update,
-            release_update=self._release_update,
-        )
         self._web_api = WebAPI(
             context,
             self._cache,
             self._get_advanced_settings,
             self._save_advanced_settings,
-            self._begin_page_mutation,
-            self._end_page_mutation,
-            self._update_coordinator,
             PLUGIN_VERSION,
         )
         self._web_api.register()
@@ -110,8 +130,8 @@ class CanvasForgePlugin(Star):
         """Create long-lived resources without requiring a configured Key."""
 
         self._configure_llm_tool_schemas()
+        await self._start_legacy_update_cleanup()
         await self._ensure_runtime()
-        await self._update_coordinator.initialize()
         settings = await self._get_advanced_settings()
         try:
             await self._cache.initialize(settings["cache_max_images"])
@@ -226,6 +246,8 @@ class CanvasForgePlugin(Star):
     ) -> str:
         """Run either public LLM tool with common error formatting."""
 
+        job: _GenerationJob | None = None
+        handed_off = False
         try:
             if requested_mode == "edit" and avatar_targets is None:
                 raise CanvasForgeError(
@@ -233,13 +255,14 @@ class CanvasForgePlugin(Star):
                     "当前聊天 AI 未提交必填的 avatar_targets；"
                     "只使用回复图片时也必须传空数组。本次尚未调用图像接口。",
                 )
-            mode = await self._generate_and_send(
+            job = await self._prepare_generation_job(
                 event,
                 prompt,
-                send_progress=False,
                 avatar_targets=avatar_targets,
                 requested_mode=requested_mode,
             )
+            await self._start_generation_task(job)
+            handed_off = True
         except CanvasForgeError as exc:
             return f"CanvasForge 工具调用失败（{exc.code.value}）：{exc}"
         except Exception as exc:
@@ -252,9 +275,17 @@ class CanvasForgePlugin(Star):
                 f"（{ErrorCode.INTERNAL.value}）："
                 "CanvasForge 处理请求时发生内部错误，请稍后再试。"
             )
+        finally:
+            if (
+                job is not None
+                and not handed_off
+                and not job.lease.finished
+            ):
+                await job.lease.release()
 
-        action = "引用图编辑" if mode == "edit" else "图片生成"
-        return f"CanvasForge 已完成{action}，图片已发送到当前 QQ 会话。"
+        return (
+            "CanvasForge 任务已受理，完成后图片会直接发送到当前 QQ 会话。"
+        )
 
     @filter.command("canvasforge")
     async def canvasforge_command(self, event: AstrMessageEvent) -> None:
@@ -272,38 +303,65 @@ class CanvasForgePlugin(Star):
             )
             return
 
+        job: _GenerationJob | None = None
+        handed_off = False
         try:
-            await self._generate_and_send(
+            job = await self._prepare_generation_job(
                 event,
                 prompt,
-                send_progress=True,
             )
         except CanvasForgeError as exc:
             await self._send_command_text(event, str(exc))
+            return
         except Exception as exc:
             logger.error(
-                "CanvasForge command failed unexpectedly (%s).",
+                "CanvasForge command preflight failed unexpectedly (%s).",
                 type(exc).__name__,
             )
             await self._send_command_text(
                 event,
                 "CanvasForge 处理请求时发生内部错误，请稍后再试。",
             )
+            return
 
-    async def _generate_and_send(
+        try:
+            accepted = await self._send_command_text(
+                event,
+                "CanvasForge 任务已受理，完成后图片会直接发送。",
+            )
+            if not accepted:
+                return
+            await self._start_generation_task(job)
+            handed_off = True
+        except asyncio.CancelledError:
+            raise
+        except CanvasForgeError as exc:
+            await self._send_command_text(event, str(exc))
+        except Exception as exc:
+            logger.error(
+                "CanvasForge command handoff failed unexpectedly (%s).",
+                type(exc).__name__,
+            )
+            await self._send_command_text(
+                event,
+                "CanvasForge 后台任务未能启动，请稍后再试。",
+            )
+        finally:
+            if not handed_off and not job.lease.finished:
+                await job.lease.release()
+
+    async def _prepare_generation_job(
         self,
         event: AstrMessageEvent,
         prompt: str,
         *,
-        send_progress: bool,
         avatar_targets: list[str] | None = None,
         requested_mode: str | None = None,
-    ) -> str:
-        """Run one paid request and commit cooldown only after QQ delivery."""
+    ) -> _GenerationJob:
+        """Validate locally, take a settings snapshot and reserve the slot."""
 
         if requested_mode not in (None, "generate", "edit"):
             raise CanvasForgeError(ErrorCode.INTERNAL)
-        await self._reject_if_updating()
         if event.get_platform_name() != "aiocqhttp":
             raise CanvasForgeError(ErrorCode.PLATFORM_UNSUPPORTED)
 
@@ -318,15 +376,167 @@ class CanvasForgePlugin(Star):
         if not base_url or not api_key:
             raise CanvasForgeError(ErrorCode.NOT_CONFIGURED)
 
+        if avatar_targets is not None and not isinstance(
+            avatar_targets,
+            list,
+        ):
+            raise CanvasForgeError(ErrorCode.AVATAR_TARGET_INVALID)
+        frozen_avatar_targets = (
+            tuple(avatar_targets) if avatar_targets is not None else None
+        )
         user_id = self._event_string(event, "get_sender_id")
         if not user_id:
             user_id = self._event_string(event, "get_session_id") or "unknown"
-        lease = await self._acquire_generation_lease(
-            user_id,
-            is_admin=is_admin,
-            cooldown_seconds=settings["cooldown_seconds"],
+
+        async with self._lifecycle_lock:
+            if self._closing:
+                raise CanvasForgeError(
+                    ErrorCode.BUSY,
+                    "CanvasForge 正在关闭，暂时不能接收新的生图任务。",
+                )
+            lease = await self._acquire_generation_lease(
+                user_id,
+                is_admin=is_admin,
+                cooldown_seconds=settings["cooldown_seconds"],
+            )
+
+        return _GenerationJob(
+            event=event,
+            prompt=normalized_prompt,
+            requested_mode=requested_mode,
+            avatar_targets=frozen_avatar_targets,
+            base_url=base_url,
+            api_key=api_key,
+            settings=MappingProxyType(dict(settings)),
+            lease=lease,
         )
 
+    async def _start_generation_task(self, job: _GenerationJob) -> None:
+        """Atomically hand one leased job to a strongly held background task."""
+
+        task: asyncio.Task[None] | None = None
+        creation_error: Exception | None = None
+        async with self._lifecycle_lock:
+            if not self._closing:
+                operation = self._run_background_generation(job)
+                try:
+                    task = asyncio.create_task(
+                        operation,
+                        name="canvasforge-generation",
+                    )
+                except Exception as exc:
+                    operation.close()
+                    creation_error = exc
+                else:
+                    self._generation_tasks.add(task)
+                    self._generation_leases[task] = job.lease
+                    task.add_done_callback(self._generation_task_done)
+
+        if task is not None:
+            return
+
+        if not job.lease.finished:
+            await job.lease.release()
+        if creation_error is not None:
+            logger.error(
+                "CanvasForge could not create a background task (%s).",
+                type(creation_error).__name__,
+            )
+            raise CanvasForgeError(
+                ErrorCode.INTERNAL,
+                "CanvasForge 后台任务未能启动，请稍后再试。",
+            )
+        raise CanvasForgeError(
+            ErrorCode.BUSY,
+            "CanvasForge 正在关闭，暂时不能接收新的生图任务。",
+        )
+
+    def _generation_task_done(self, task: asyncio.Task[None]) -> None:
+        """Drop the strong reference and always retrieve the task result."""
+
+        self._generation_tasks.discard(task)
+        lease = self._generation_leases.pop(task, None)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error(
+                "CanvasForge background task escaped its guard (%s).",
+                type(exc).__name__,
+            )
+        if lease is None or lease.finished:
+            return
+
+        operation = self._release_abandoned_lease(lease)
+        try:
+            cleanup_task = asyncio.create_task(
+                operation,
+                name="canvasforge-lease-cleanup",
+            )
+        except Exception as exc:
+            operation.close()
+            logger.error(
+                "CanvasForge could not schedule lease cleanup (%s).",
+                type(exc).__name__,
+            )
+            return
+        self._lease_cleanup_tasks.add(cleanup_task)
+        cleanup_task.add_done_callback(self._lease_cleanup_done)
+
+    @staticmethod
+    async def _release_abandoned_lease(lease: RequestLease) -> None:
+        if not lease.finished:
+            await lease.release()
+
+    def _lease_cleanup_done(self, task: asyncio.Task[None]) -> None:
+        self._lease_cleanup_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.error(
+                "CanvasForge could not release an abandoned lease (%s).",
+                type(exc).__name__,
+            )
+
+    async def _run_background_generation(
+        self,
+        job: _GenerationJob,
+    ) -> None:
+        """Run a handed-off job and report late failures directly to QQ."""
+
+        try:
+            await self._execute_generation_job(job)
+        except asyncio.CancelledError:
+            raise
+        except CanvasForgeError as exc:
+            await self._send_command_text(
+                job.event,
+                f"CanvasForge 生图失败（{exc.code.value}）：{exc}",
+            )
+        except Exception as exc:
+            logger.error(
+                "CanvasForge background generation failed unexpectedly (%s).",
+                type(exc).__name__,
+            )
+            await self._send_command_text(
+                job.event,
+                "CanvasForge 处理生图任务时发生内部错误，请稍后再试。",
+            )
+
+    async def _execute_generation_job(
+        self,
+        job: _GenerationJob,
+    ) -> str:
+        """Run one paid request and commit cooldown only after QQ delivery."""
+
+        event = job.event
+        requested_mode = job.requested_mode
+        avatar_targets = job.avatar_targets
+        settings = job.settings
+        lease = job.lease
         try:
             (
                 provider_factory,
@@ -351,21 +561,11 @@ class CanvasForgePlugin(Star):
             # This request-local provider cannot be changed by a concurrent
             # invocation or a Page configuration save.
             provider = provider_factory.create(
-                HttpKeyProviderConfig(base_url=base_url, api_key=api_key),
+                HttpKeyProviderConfig(
+                    base_url=job.base_url,
+                    api_key=job.api_key,
+                ),
             )
-
-            if send_progress:
-                try:
-                    await event.send(
-                        MessageChain(
-                            chain=[Comp.Plain("CanvasForge 已受理，正在生成图片…")],
-                        ),
-                    )
-                except Exception:
-                    raise CanvasForgeError(
-                        ErrorCode.SEND_FAILED,
-                        "无法向 QQ 发送进度消息，本次生成已取消。",
-                    ) from None
 
             if requested_mode == "generate":
                 references = []
@@ -411,7 +611,7 @@ class CanvasForgePlugin(Star):
                     "本次尚未调用图片接口。",
                 )
             request_prompt = self._with_avatar_mapping(
-                normalized_prompt,
+                job.prompt,
                 resolved_avatars,
                 reply_reference_count=len(references) - len(resolved_avatars),
             )
@@ -621,15 +821,6 @@ class CanvasForgePlugin(Star):
                 self._avatar_resolver,
             )
 
-    async def _get_http_session(self) -> aiohttp.ClientSession:
-        """Return the instance session used for public GitHub checks."""
-
-        await self._ensure_runtime()
-        session = self._session
-        if session is None or session.closed:
-            raise RuntimeError("CanvasForge HTTP session is unavailable")
-        return session
-
     async def _configuration_snapshot(
         self,
     ) -> tuple[str, str, dict[str, Any]]:
@@ -825,14 +1016,16 @@ class CanvasForgePlugin(Star):
         self,
         event: AstrMessageEvent,
         text: str,
-    ) -> None:
+    ) -> bool:
         try:
             await event.send(MessageChain(chain=[Comp.Plain(text)]))
+            return True
         except Exception as exc:
             logger.error(
                 "CanvasForge could not send a command response (%s).",
                 type(exc).__name__,
             )
+            return False
 
     @staticmethod
     def _validate_prompt(prompt: str, maximum: int) -> str:
@@ -968,26 +1161,124 @@ class CanvasForgePlugin(Star):
             return ""
         return str(value).strip() if value is not None else ""
 
+    async def _start_legacy_update_cleanup(self) -> None:
+        """Remove only the retired updater's two fixed status files.
+
+        During an in-place upgrade, the v0.1.6 update task can still be
+        finishing after v0.1.7 has initialized. In that case cleanup is
+        detached until every known legacy writer has stopped, preventing the
+        obsolete status file from being recreated after it was removed.
+        """
+
+        runtime = getattr(self.context, _LEGACY_UPDATE_CONTEXT_KEY, None)
+        if self._live_legacy_update_tasks(runtime):
+            operation = self._wait_for_legacy_update_cleanup(runtime)
+            try:
+                task = asyncio.create_task(
+                    operation,
+                    name="canvasforge-legacy-update-cleanup",
+                )
+            except Exception as exc:
+                operation.close()
+                logger.warning(
+                    "CanvasForge could not schedule legacy update cleanup "
+                    "(%s); it will be retried on the next startup.",
+                    type(exc).__name__,
+                )
+                return
+            self._legacy_cleanup_task = task
+            task.add_done_callback(self._legacy_cleanup_done)
+            return
+        try:
+            await self._cleanup_legacy_update_state(runtime)
+        except Exception as exc:
+            logger.warning(
+                "CanvasForge legacy update cleanup failed (%s); "
+                "it will be retried on the next startup.",
+                type(exc).__name__,
+            )
+
+    async def _wait_for_legacy_update_cleanup(
+        self,
+        runtime: Any,
+    ) -> None:
+        """Wait for legacy writers without ever delaying plugin startup."""
+
+        while True:
+            live_tasks = self._live_legacy_update_tasks(runtime)
+            if not live_tasks:
+                break
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in live_tasks),
+                return_exceptions=True,
+            )
+        await self._cleanup_legacy_update_state(runtime)
+
     @staticmethod
-    def _get_admission_runtime(context: Context) -> dict[str, Any]:
-        """Keep update admission state alive while this plugin reloads itself."""
+    def _live_legacy_update_tasks(runtime: Any) -> tuple[asyncio.Task[Any], ...]:
+        if not isinstance(runtime, dict):
+            return ()
+        tasks: set[asyncio.Task[Any]] = set()
+        for key in ("update_task", "accepted_watchdog", "check_task"):
+            candidate = runtime.get(key)
+            if (
+                isinstance(candidate, asyncio.Task)
+                and not candidate.done()
+            ):
+                tasks.add(candidate)
+        return tuple(tasks)
 
-        current = getattr(context, _ADMISSION_CONTEXT_KEY, None)
-        if (
-            isinstance(current, dict)
-            and current.get("schema") == 2
-            and hasattr(current.get("lock"), "__aenter__")
+    def _legacy_cleanup_done(self, task: asyncio.Task[None]) -> None:
+        if self._legacy_cleanup_task is task:
+            self._legacy_cleanup_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.warning(
+                "CanvasForge legacy update cleanup failed (%s); "
+                "it will be retried on the next startup.",
+                type(exc).__name__,
+            )
+
+    async def _cleanup_legacy_update_state(self, runtime: Any) -> None:
+        failures = await asyncio.to_thread(
+            self._remove_legacy_update_status_files,
+            self._data_root,
+        )
+        if failures:
+            logger.warning(
+                "CanvasForge could not remove every legacy update status "
+                "file (%s); cleanup will be retried on the next startup.",
+                ", ".join(failures),
+            )
+
+        for key, expected in (
+            (_LEGACY_UPDATE_CONTEXT_KEY, runtime),
+            (
+                _LEGACY_ADMISSION_CONTEXT_KEY,
+                getattr(self.context, _LEGACY_ADMISSION_CONTEXT_KEY, None),
+            ),
         ):
-            return current
+            if expected is None or getattr(self.context, key, None) is not expected:
+                continue
+            try:
+                delattr(self.context, key)
+            except (AttributeError, TypeError):
+                pass
 
-        runtime: dict[str, Any] = {
-            "schema": 2,
-            "lock": asyncio.Lock(),
-            "update_owner": None,
-            "page_mutations": 0,
-        }
-        setattr(context, _ADMISSION_CONTEXT_KEY, runtime)
-        return runtime
+    @staticmethod
+    def _remove_legacy_update_status_files(
+        data_root: Path,
+    ) -> tuple[str, ...]:
+        failures: list[str] = []
+        for filename in _LEGACY_UPDATE_STATUS_FILENAMES:
+            try:
+                (data_root / filename).unlink(missing_ok=True)
+            except OSError as exc:
+                failures.append(type(exc).__name__)
+        return tuple(failures)
 
     async def _acquire_generation_lease(
         self,
@@ -998,7 +1289,7 @@ class CanvasForgePlugin(Star):
     ) -> RequestLease:
         """Acquire without leaking a busy slot across task cancellation."""
 
-        operation = self._reserve_generation_lease(
+        operation = self._request_gate.acquire(
             user_id,
             is_admin=is_admin,
             cooldown_seconds=cooldown_seconds,
@@ -1024,86 +1315,12 @@ class CanvasForgePlugin(Star):
             raise cancellation
         return lease
 
-    async def _reject_if_updating(self) -> None:
-        """Give tools and commands the maintenance result before other checks."""
-
-        async with self._admission["lock"]:
-            if self._admission.get("update_owner") is not None:
-                raise CanvasForgeError(
-                    ErrorCode.BUSY,
-                    "CanvasForge 正在更新，请稍后再试。",
-                )
-
-    async def _reserve_generation_lease(
-        self,
-        user_id: str,
-        *,
-        is_admin: bool,
-        cooldown_seconds: float,
-    ) -> RequestLease:
-        """Atomically exclude a new paid request from a pending self-update."""
-
-        async with self._admission["lock"]:
-            if self._admission.get("update_owner") is not None:
-                raise CanvasForgeError(
-                    ErrorCode.BUSY,
-                    "CanvasForge 正在更新，请稍后再试。",
-                )
-            return await self._request_gate.acquire(
-                user_id,
-                is_admin=is_admin,
-                cooldown_seconds=cooldown_seconds,
-            )
-
-    async def _begin_page_mutation(self) -> bool:
-        """Reserve one Page write unless an update is already in progress."""
-
-        async with self._admission["lock"]:
-            if self._admission.get("update_owner") is not None:
-                return False
-            self._admission["page_mutations"] += 1
-            return True
-
-    async def _end_page_mutation(self) -> None:
-        async def decrement() -> None:
-            async with self._admission["lock"]:
-                self._admission["page_mutations"] = max(
-                    0,
-                    int(self._admission["page_mutations"]) - 1,
-                )
-
-        await self._finish_admission_cleanup(decrement())
-
-    async def _reserve_update(self, owner: str) -> bool:
-        """Atomically enter maintenance only while every writer is idle."""
-
-        if not isinstance(owner, str) or len(owner) != 32:
-            return False
-        async with self._admission["lock"]:
-            if self._admission.get("update_owner") is not None:
-                return False
-            if int(self._admission["page_mutations"]) > 0:
-                return False
-            if await self._request_gate.is_busy():
-                return False
-            self._admission["update_owner"] = owner
-            return True
-
-    async def _release_update(self, owner: str) -> None:
-        """Leave maintenance after the detached updater reaches a terminal state."""
-
-        async def release() -> None:
-            async with self._admission["lock"]:
-                if self._admission.get("update_owner") == owner:
-                    self._admission["update_owner"] = None
-
-        await self._finish_admission_cleanup(release())
-
     @staticmethod
-    async def _finish_admission_cleanup(operation: Awaitable[None]) -> None:
-        """Finish state cleanup even when its request task is being cancelled."""
+    async def _await_task_cancellation_safe(
+        task: asyncio.Task[None],
+    ) -> None:
+        """Finish one shutdown task before propagating caller cancellation."""
 
-        task = contextvars.Context().run(asyncio.create_task, operation)
         cancellation: asyncio.CancelledError | None = None
         while not task.done():
             try:
@@ -1111,21 +1328,68 @@ class CanvasForgePlugin(Star):
             except asyncio.CancelledError as exc:
                 if cancellation is None:
                     cancellation = exc
-        task.result()
+        try:
+            task.result()
+        except BaseException:
+            if cancellation is not None:
+                raise cancellation from None
+            raise
         if cancellation is not None:
             raise cancellation
 
     async def terminate(self) -> None:
-        """Close every long-lived network resource on plugin unload."""
+        """Block admission, drain jobs, then close the shared HTTP session."""
 
+        async with self._lifecycle_lock:
+            self._closing = True
+            task = self._termination_task
+            if task is None:
+                operation = self._terminate_resources()
+                task = contextvars.Context().run(
+                    asyncio.create_task,
+                    operation,
+                )
+                self._termination_task = task
+        await self._await_task_cancellation_safe(task)
+
+    async def _terminate_resources(self) -> None:
         self._web_api.deactivate()
-        try:
-            await self._update_coordinator.deactivate()
-        except Exception as exc:
-            logger.error(
-                "CanvasForge update coordinator shutdown failed (%s).",
-                type(exc).__name__,
+        async with self._lifecycle_lock:
+            tasks = tuple(self._generation_tasks)
+            leases = tuple(
+                lease
+                for task in tasks
+                if (lease := self._generation_leases.get(task)) is not None
             )
+
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        for lease in leases:
+            if lease.finished:
+                continue
+            try:
+                await lease.release()
+            except Exception as exc:
+                logger.error(
+                    "CanvasForge could not release a generation slot (%s).",
+                    type(exc).__name__,
+                )
+
+        lease_cleanup_tasks = tuple(self._lease_cleanup_tasks)
+        if lease_cleanup_tasks:
+            await asyncio.gather(
+                *lease_cleanup_tasks,
+                return_exceptions=True,
+            )
+
+        cleanup_task = self._legacy_cleanup_task
+        if cleanup_task is not None and not cleanup_task.done():
+            cleanup_task.cancel()
+            await asyncio.gather(cleanup_task, return_exceptions=True)
+
         async with self._runtime_lock:
             session = self._session
             self._provider_factory = None

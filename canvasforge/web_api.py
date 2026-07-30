@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import contextvars
 import inspect
 import re
 from collections.abc import Awaitable, Callable, Mapping
@@ -13,33 +12,10 @@ from typing import Any
 from astrbot.api.web import error_response, file_response, json_response, request
 
 from .cache import CacheError, CacheNotFoundError, CacheStore
-from .update import UpdateCoordinator, UpdateCoordinatorError
 
 
 PLUGIN_NAME = "astrbot_plugin_canvasforge"
 _CACHE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
-_NO_STORE_HEADERS = {"Cache-Control": "no-store"}
-
-
-class _StartUpdateAfterResponse:
-    """Response callback that starts the update after HTTP 202 is sent."""
-
-    def __init__(self, updates: UpdateCoordinator, job_id: str) -> None:
-        self._updates = updates
-        self._job_id = job_id
-
-    async def __call__(self) -> None:
-        try:
-            started = await self._updates.start_accepted(self._job_id)
-            if not started:
-                await self._updates.abort_accepted(self._job_id)
-        except BaseException:
-            # Do not let response-background failures expose internals or
-            # strand the shared maintenance state.
-            try:
-                await self._updates.abort_accepted(self._job_id)
-            except BaseException:
-                pass
 
 
 ADVANCED_DEFAULTS: dict[str, Any] = {
@@ -146,18 +122,12 @@ class WebAPI:
         cache_store: CacheStore,
         get_settings: Callable[[], Mapping[str, Any] | Awaitable[Mapping[str, Any]]],
         save_settings: Callable[[dict[str, Any]], Any | Awaitable[Any]],
-        begin_mutation: Callable[[], bool | Awaitable[bool]],
-        end_mutation: Callable[[], Any | Awaitable[Any]],
-        update_coordinator: UpdateCoordinator,
         plugin_version: str,
     ) -> None:
         self._context = context
         self._cache = cache_store
         self._get_settings_callback = get_settings
         self._save_settings_callback = save_settings
-        self._begin_mutation_callback = begin_mutation
-        self._end_mutation_callback = end_mutation
-        self._updates = update_coordinator
         self._plugin_version = str(plugin_version)
         self._settings_save_lock = asyncio.Lock()
         self._registered = False
@@ -169,24 +139,6 @@ class WebAPI:
         if self._registered:
             return
         routes = (
-            (
-                "/update/check",
-                self.check_update,
-                ["GET"],
-                "Check CanvasForge release updates",
-            ),
-            (
-                "/update/apply",
-                self.apply_update,
-                ["POST"],
-                "Apply one verified CanvasForge update",
-            ),
-            (
-                "/update/status",
-                self.get_update_status,
-                ["GET"],
-                "Read CanvasForge update status",
-            ),
             ("/settings", self.get_settings, ["GET"], "Get CanvasForge advanced settings"),
             ("/settings", self.save_settings, ["POST"], "Save CanvasForge advanced settings"),
             ("/cache", self.list_cache, ["GET"], "List CanvasForge image cache"),
@@ -230,119 +182,6 @@ class WebAPI:
 
         self._active = False
 
-    async def check_update(self):
-        unauthorized = self._require_authenticated(no_store=True)
-        if unauthorized is not None:
-            return unauthorized
-        force_value = request.query.get("force")
-        force = str(force_value).strip().lower() in {"1", "true", "yes"}
-        try:
-            result = await self._updates.check(
-                str(request.username),
-                force=force,
-            )
-            return json_response(result, headers=_NO_STORE_HEADERS)
-        except UpdateCoordinatorError as exc:
-            return error_response(
-                str(exc),
-                status_code=exc.status_code,
-                headers=_NO_STORE_HEADERS,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return error_response(
-                "无法检查 CanvasForge 更新，请稍后重试",
-                status_code=500,
-                headers=_NO_STORE_HEADERS,
-            )
-
-    async def apply_update(self):
-        unauthorized = self._require_authenticated(no_store=True)
-        if unauthorized is not None:
-            return unauthorized
-        payload = await request.json(default=None)
-        if (
-            not isinstance(payload, dict)
-            or set(payload) != {"check_id"}
-            or not isinstance(payload.get("check_id"), str)
-            or not payload["check_id"].strip()
-            or len(payload["check_id"]) > 256
-        ):
-            return error_response(
-                "请求只能包含有效的 check_id",
-                status_code=400,
-                headers=_NO_STORE_HEADERS,
-            )
-        staged_job_id = ""
-        try:
-            result = await self._updates.apply(
-                str(request.username),
-                payload["check_id"],
-            )
-            staged_job_id = str(result["job_id"])
-            response = json_response(
-                result,
-                status_code=202,
-                headers=_NO_STORE_HEADERS,
-            )
-            try:
-                if not hasattr(response, "background"):
-                    raise AttributeError
-                if response.background is not None:
-                    raise RuntimeError
-                response.background = _StartUpdateAfterResponse(
-                    self._updates,
-                    staged_job_id,
-                )
-            except BaseException:
-                await self._updates.abort_accepted(staged_job_id)
-                staged_job_id = ""
-                return error_response(
-                    "当前 AstrBot 无法安全地在响应后启动更新，请使用原生插件管理更新。",
-                    status_code=503,
-                    headers=_NO_STORE_HEADERS,
-                )
-            staged_job_id = ""
-            return response
-        except UpdateCoordinatorError as exc:
-            return error_response(
-                str(exc),
-                status_code=exc.status_code,
-                headers=_NO_STORE_HEADERS,
-            )
-        except asyncio.CancelledError:
-            if staged_job_id:
-                await self._updates.abort_accepted(staged_job_id)
-            raise
-        except Exception:
-            if staged_job_id:
-                await self._updates.abort_accepted(staged_job_id)
-            return error_response(
-                "无法受理 CanvasForge 更新，请重新检查后再试",
-                status_code=500,
-                headers=_NO_STORE_HEADERS,
-            )
-
-    async def get_update_status(self):
-        unauthorized = self._require_authenticated(
-            allow_inactive=True,
-            no_store=True,
-        )
-        if unauthorized is not None:
-            return unauthorized
-        try:
-            result = await self._updates.status()
-            return json_response(result, headers=_NO_STORE_HEADERS)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return error_response(
-                "暂时无法读取 CanvasForge 更新状态",
-                status_code=500,
-                headers=_NO_STORE_HEADERS,
-            )
-
     async def get_settings(self):
         unauthorized = self._require_authenticated()
         if unauthorized is not None:
@@ -362,43 +201,38 @@ class WebAPI:
         payload = await request.json(default={})
         if not isinstance(payload, dict):
             return error_response("设置内容必须是 JSON 对象", status_code=400)
-        if not await self._reserve_mutation():
-            return error_response("CanvasForge 正在更新，暂时不能保存设置", status_code=409)
-        try:
-            async with self._settings_save_lock:
-                try:
-                    current = await self._call(self._get_settings_callback)
-                    merged = normalize_settings(current)
-                    merged.update(payload)
-                    merged = normalize_settings(merged, strict=True)
-                    evicted = await self._call(
-                        self._save_settings_callback,
-                        merged,
-                    )
-                    if (
-                        isinstance(evicted, bool)
-                        or not isinstance(evicted, int)
-                        or evicted < 0
-                    ):
-                        raise RuntimeError("invalid settings callback result")
-                    return json_response(
-                        {
-                            "saved": True,
-                            "settings": merged,
-                            "evicted": evicted,
-                        },
-                    )
-                except ValueError as exc:
-                    return error_response(str(exc), status_code=400)
-                except CacheError:
-                    return error_response(
-                        "生成设置已保存，但缓存调整失败；已暂停新增缓存，请重载插件后重试。",
-                        status_code=500,
-                    )
-                except Exception:
-                    return error_response("无法保存生成设置", status_code=500)
-        finally:
-            await self._call(self._end_mutation_callback)
+        async with self._settings_save_lock:
+            try:
+                current = await self._call(self._get_settings_callback)
+                merged = normalize_settings(current)
+                merged.update(payload)
+                merged = normalize_settings(merged, strict=True)
+                evicted = await self._call(
+                    self._save_settings_callback,
+                    merged,
+                )
+                if (
+                    isinstance(evicted, bool)
+                    or not isinstance(evicted, int)
+                    or evicted < 0
+                ):
+                    raise RuntimeError("invalid settings callback result")
+                return json_response(
+                    {
+                        "saved": True,
+                        "settings": merged,
+                        "evicted": evicted,
+                    },
+                )
+            except ValueError as exc:
+                return error_response(str(exc), status_code=400)
+            except CacheError:
+                return error_response(
+                    "生成设置已保存，但缓存调整失败；已暂停新增缓存，请重载插件后重试。",
+                    status_code=500,
+                )
+            except Exception:
+                return error_response("无法保存生成设置", status_code=500)
 
     async def list_cache(self):
         unauthorized = self._require_authenticated()
@@ -483,8 +317,6 @@ class WebAPI:
             return unauthorized
         if not self._valid_cache_id(cache_id):
             return error_response("缓存图片不存在", status_code=404)
-        if not await self._reserve_mutation():
-            return error_response("CanvasForge 正在更新，暂时不能删除缓存", status_code=409)
         try:
             deleted = await self._cache.delete(cache_id)
             if not deleted:
@@ -492,41 +324,27 @@ class WebAPI:
             return json_response({"deleted": True, "id": cache_id})
         except CacheError:
             return error_response("无法删除缓存图片", status_code=500)
-        finally:
-            await self._call(self._end_mutation_callback)
 
     async def clear(self):
         unauthorized = self._require_authenticated()
         if unauthorized is not None:
             return unauthorized
-        if not await self._reserve_mutation():
-            return error_response("CanvasForge 正在更新，暂时不能清空缓存", status_code=409)
         try:
             removed = await self._cache.clear()
             return json_response({"cleared": True, "removed": removed})
         except CacheError:
             return error_response("无法清空图片缓存", status_code=500)
-        finally:
-            await self._call(self._end_mutation_callback)
 
-    def _require_authenticated(
-        self,
-        *,
-        allow_inactive: bool = False,
-        no_store: bool = False,
-    ):
-        headers = _NO_STORE_HEADERS if no_store else None
+    def _require_authenticated(self):
         if not getattr(request, "username", None):
             return error_response(
                 "未授权访问",
                 status_code=401,
-                headers=headers,
             )
-        if not allow_inactive and not self._active:
+        if not self._active:
             return error_response(
                 "CanvasForge 已卸载或正在重载，请稍后刷新控制台",
                 status_code=503,
-                headers=headers,
             )
         return None
 
@@ -540,29 +358,3 @@ class WebAPI:
         if inspect.isawaitable(result):
             return await result
         return result
-
-    async def _reserve_mutation(self) -> bool:
-        """Transfer a Page mutation reservation without a cancellation leak."""
-
-        operation = self._call(self._begin_mutation_callback)
-        task = contextvars.Context().run(asyncio.create_task, operation)
-        cancellation: asyncio.CancelledError | None = None
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError as exc:
-                if cancellation is None:
-                    cancellation = exc
-
-        try:
-            reserved = bool(task.result())
-        except BaseException:
-            if cancellation is not None:
-                raise cancellation from None
-            raise
-
-        if cancellation is not None:
-            if reserved:
-                await self._call(self._end_mutation_callback)
-            raise cancellation
-        return reserved

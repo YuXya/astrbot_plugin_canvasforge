@@ -9,7 +9,7 @@ import ipaddress
 import json
 import math
 import warnings
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from io import BytesIO
 from typing import Any, Mapping, Sequence
 from urllib.parse import SplitResult, urlsplit, urlunsplit
@@ -48,7 +48,7 @@ class Sub2APIConnection:
     """An immutable connection snapshot so hot updates cannot mix fields."""
 
     base_url: str = ""
-    api_key: str = ""
+    api_key: str = field(default="", repr=False)
 
 
 def _is_http_allowed_host(hostname: str) -> bool:

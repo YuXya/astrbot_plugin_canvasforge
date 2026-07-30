@@ -7,7 +7,7 @@ CanvasForge 是面向 AstrBot + NapCat QQ 的图片生成插件。它通过 Sub2
 - 按聊天 AI 的人物意图使用发送者、机器人或被 `@` 群友的 QQ 头像作为参考；
 - AstrBot LLM Tool 自然语言调用；
 - `/canvasforge <提示词>` 命令调用；
-- 带高级设置、最近图片缓存和版本更新入口的 AstrBot Plugin Page。
+- 带高级设置和最近图片缓存的 AstrBot Plugin Page。
 
 ## 运行要求
 
@@ -34,7 +34,7 @@ CanvasForge 使用 AstrBot 4.26.7 提供的异步配置保存接口，4.26.6 及
 
 公网地址必须使用 HTTPS。本机、回环/内网地址及本地容器主机名可使用 HTTP。
 
-使用 LLM Tool 时，AstrBot 自身的 `tool_call_timeout` 也会约束工具执行时间。若保留 CanvasForge 默认的 300 秒请求超时，请把对应聊天 Provider 的工具调用超时设置为不少于 300 秒；命令调用不受这项工具超时影响。
+LLM Tool 和 `/canvasforge` 命令完成基础校验并占用唯一任务位后会立即返回，生图在插件后台继续执行；成功后图片由插件直接发送到 QQ。此流程不会等待第二次聊天模型调用。
 
 ## 使用
 
@@ -113,21 +113,13 @@ QQ 头像可能是默认头像、旧缓存或卡通形象，只能作为外观�
 
 ## 检查与安装更新
 
-CanvasForge 控制台只会在管理员点击“检查更新”后检查
-[`YuXya/astrbot_plugin_canvasforge`](https://github.com/YuXya/astrbot_plugin_canvasforge)
-的最新正式 GitHub Release。打开控制台不会访问 GitHub，也不会在后台轮询更新状态。发现更高版本后，管理员可以在确认版本变化后执行更新；插件会委托 AstrBot 核心下载、校验并重载自身，更新进度和控制台刷新也都需要管理员手动点击。
+CanvasForge 不再提供自有更新面板或更新 API。请由管理员统一通过 AstrBot 插件管理检查和安装更新。
 
-- 仅识别 `vMAJOR.MINOR.PATCH` 格式的正式 Release，不安装 draft 或 prerelease；
-- 检查和安装会锁定同一个 Git Commit，不会在确认后改为安装变化后的 `main`；
-- 更新期间不会中断正在进行的付费生图；有生成任务时会直接拒绝本次更新；
-- 控制台不会读取或转发 Dashboard Token，也不接受页面传入的仓库、下载地址、代理或 Commit；
-- GitHub 连接失败时，请改用 AstrBot 插件管理中的“更新/重新安装”，并在那里选择需要的 GitHub 代理。
+如果原生更新失败或插件异常，请在 AstrBot 插件管理中使用以下固定 GitHub 地址重新安装：
 
-页内更新会先检测当前 AstrBot 是否提供兼容的内部插件更新能力；接口不存在或签名不兼容时会停止操作并提示使用原生更新入口。AstrBot 核心更新不是完整的事务式安装：如果新代码覆盖后发生依赖或重载失败，可能仍需从插件管理按 GitHub 地址重新安装。
+[`https://github.com/YuXya/astrbot_plugin_canvasforge`](https://github.com/YuXya/astrbot_plugin_canvasforge)
 
-CanvasForge 不保存历史更新包或旧版本备份。AstrBot 核心只复用一个固定名称的临时 ZIP，成功后删除；极端清理失败时，下一次更新也会覆盖同一路径，不会按版本无限累计。
-
-CanvasForge 自身不会记录下载地址、Commit、插件路径或响应正文。AstrBot 核心更新器仍可能按其原生行为在 AstrBot 日志中记录固定 GitHub 归档地址和插件安装路径；其中不含 Sub2API Key 或 Dashboard 凭据，插件也不会通过全局日志修改去掩盖上游日志。
+仓库地址应保持固定；GitHub 代理、下载和插件重载均交由 AstrBot 原生插件管理处理。
 
 ### 发布新版本
 
@@ -136,12 +128,13 @@ CanvasForge 自身不会记录下载地址、Commit、插件路径或响应正�
 3. 从该提交创建同名的 `vX.Y.Z` Tag；
 4. 使用该 Tag 创建正式 GitHub Release。
 
-只有推送分支或创建 Tag、但没有创建正式 Release 时，控制台不会把它识别为可安装的新版本。
-只有正式发布的 Release 才会被识别为可安装版本；当前代码版本为 `v0.1.6`。
+只有推送分支或创建 Tag、但没有创建正式 Release 时，AstrBot 插件管理可能无法识别为可安装的新版本。
+当前代码版本为 `v0.1.7`。
 
 ## 行为边界
 
 - 全插件仅允许一个进行中的生成请求，不排队；
+- 工具和命令在受理后立即返回，后台完成后由插件直接发送图片或安全错误提示；
 - “仅允许管理员使用”默认开启，同时限制两个 LLM 工具和 `/canvasforge` 命令；可在生成设置中关闭；
 - 每位 QQ 用户默认成功生成后冷却 300 秒；
 - 管理员绕过用户冷却，但不能绕过全局单任务限制；

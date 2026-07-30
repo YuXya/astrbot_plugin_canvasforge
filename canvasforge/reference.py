@@ -841,7 +841,14 @@ async def _call_action(client: Any, action: str, **parameters: Any) -> Any:
     if not callable(call_action):
         raise RuntimeError("aiocqhttp call_action is unavailable")
 
-    result = call_action(action=action, **parameters)
+    if inspect.iscoroutinefunction(call_action):
+        return await call_action(action=action, **parameters)
+
+    result = await asyncio.to_thread(
+        call_action,
+        action=action,
+        **parameters,
+    )
     if inspect.isawaitable(result):
         return await result
     return result
