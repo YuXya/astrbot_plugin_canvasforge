@@ -8,7 +8,7 @@ import binascii
 import inspect
 import warnings
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from io import BytesIO
 from typing import Any
 from urllib.parse import unquote_to_bytes, urlsplit
@@ -61,6 +61,36 @@ class _ImageSource:
 
 
 @dataclass(frozen=True, slots=True)
+class ReferenceSnapshot:
+    """Portable direct-reply image sources captured before background work.
+
+    The snapshot deliberately retains neither the AstrBot event nor a local
+    filesystem path. Source values are limited by ``snapshot()`` to HTTP(S),
+    inline Base64, or data URIs, so a worker can resolve them after the
+    initiating event has finished.
+    """
+
+    sources: tuple[str, ...] = field(repr=False)
+    refreshed: bool = False
+    reply_message_id: int | str | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.sources, tuple):
+            raise TypeError("reference snapshot sources must be a tuple")
+        if any(
+            not isinstance(source, str) or not source.strip()
+            for source in self.sources
+        ):
+            raise ValueError("reference snapshot sources must be non-empty strings")
+
+    @property
+    def count(self) -> int:
+        """Number of direct reply images captured in this snapshot."""
+
+        return len(self.sources)
+
+
+@dataclass(frozen=True, slots=True)
 class _InspectedImage:
     mime_type: str
     extension: str
@@ -80,41 +110,148 @@ class ReferenceResolver:
         self._context = context
         self._session = session
 
-    async def has_direct_images(self, event: AstrMessageEvent) -> bool:
-        """Check whether the directly replied-to message contains images.
+    async def snapshot(self, event: AstrMessageEvent) -> ReferenceSnapshot:
+        """Capture direct-reply image sources without downloading image bytes.
 
-        Parsed reply components are inspected without downloading image bytes.
-        If AstrBot did not hydrate the quoted message, one short ``get_msg``
-        refresh is used, matching ``resolve()`` without following nested
-        replies or reading images attached to the current message.
+        Parsed, portable sources are copied directly. An empty/ambiguous reply
+        chain or a parsed image that only exposes a local path is refreshed
+        once through OneBot ``get_msg`` while the event is still available.
         """
 
         reply = self._first_reply(event)
+        expected_count: int | None = None
+        reply_message_id: int | str | None = None
+
         if reply is not None:
+            raw_message_id = getattr(reply, "id", None)
+            if raw_message_id not in (None, ""):
+                reply_message_id = self._onebot_scalar(raw_message_id)
             chain = reply.chain if isinstance(reply.chain, (list, tuple)) else []
-            if any(isinstance(item, Image) for item in chain):
-                return True
-            if chain:
-                # A populated direct reply chain was already parsed by
-                # AstrBot. Do not turn an ordinary text reply into an extra
-                # OneBot get_msg request merely to select an LLM tool.
-                return False
+            direct_images = [
+                component
+                for component in chain
+                if isinstance(component, Image)
+            ]
+            if direct_images:
+                initial_sources = [
+                    _ImageSource(self._component_source(image))
+                    for image in direct_images
+                ]
+                if all(item.source is not None for item in initial_sources):
+                    return self._snapshot_from_sources(
+                        initial_sources,
+                        refreshed=False,
+                        reply_message_id=reply_message_id,
+                    )
+                expected_count = len(direct_images)
             refresh_target: Any = reply
         else:
             refresh_target = self._raw_reply_id(event)
             if refresh_target is None:
-                return False
+                return ReferenceSnapshot(())
+            reply_message_id = self._onebot_scalar(refresh_target)
 
         try:
             refreshed = await self._refresh_sources(event, refresh_target)
         except _RefreshProblem as exc:
             logger.warning(
-                "CanvasForge could not inspect a quoted message for tool "
-                "selection (%s).",
+                "CanvasForge could not snapshot a quoted message (%s).",
                 type(exc).__name__,
             )
             raise self._invalid_reference_error() from None
-        return bool(refreshed)
+
+        if expected_count is not None and len(refreshed) != expected_count:
+            # Never silently drop one member of a parsed multi-image reply.
+            raise self._invalid_reference_error()
+        return self._snapshot_from_sources(
+            refreshed,
+            refreshed=True,
+            reply_message_id=reply_message_id,
+        )
+
+    async def has_direct_images(self, event: AstrMessageEvent) -> bool:
+        """Check whether the directly replied-to message contains images.
+
+        This compatibility wrapper now delegates to ``snapshot()`` so callers
+        that only need mode selection use the same direct-reply boundary.
+        """
+
+        return bool((await self.snapshot(event)).sources)
+
+    async def resolve_snapshot(
+        self,
+        snapshot: ReferenceSnapshot,
+        max_images: int,
+        max_total_bytes: int,
+        per_image_bytes: int = DEFAULT_PER_IMAGE_BYTES,
+        max_pixels: int = DEFAULT_MAX_PIXELS,
+        max_edge: int = DEFAULT_MAX_EDGE,
+        event: AstrMessageEvent | None = None,
+    ) -> list[ReferenceImage]:
+        """Download and validate a previously captured reference snapshot."""
+
+        if not isinstance(snapshot, ReferenceSnapshot):
+            raise TypeError("snapshot must be a ReferenceSnapshot")
+        self._validate_limits(
+            max_images=max_images,
+            max_total_bytes=max_total_bytes,
+            per_image_bytes=per_image_bytes,
+            max_pixels=max_pixels,
+            max_edge=max_edge,
+        )
+        self._check_count(snapshot.count, max_images)
+        try:
+            return await self._resolve_sources(
+                [_ImageSource(source) for source in snapshot.sources],
+                max_total_bytes=max_total_bytes,
+                per_image_bytes=per_image_bytes,
+                max_pixels=max_pixels,
+                max_edge=max_edge,
+            )
+        except _RefreshableReferenceProblem as exc:
+            if event is None or snapshot.reply_message_id is None:
+                raise CanvasForgeError(
+                    ErrorCode.REFERENCE_INVALID,
+                    str(exc),
+                ) from None
+            logger.info(
+                "CanvasForge will refresh a snapshotted quoted image batch "
+                "after a validation failure (%s).",
+                type(exc).__name__,
+            )
+        except _ReferenceLimitProblem as exc:
+            raise CanvasForgeError(
+                ErrorCode.REFERENCE_LIMIT,
+                str(exc),
+            ) from None
+        except _ReferenceProblem as exc:
+            raise CanvasForgeError(
+                ErrorCode.REFERENCE_INVALID,
+                str(exc),
+            ) from None
+
+        try:
+            refreshed = await self._refresh_sources(
+                event,
+                snapshot.reply_message_id,
+            )
+        except _RefreshProblem as exc:
+            logger.warning(
+                "CanvasForge could not refresh a snapshotted quoted image "
+                "batch (%s).",
+                type(exc).__name__,
+            )
+            raise self._invalid_reference_error() from None
+        if len(refreshed) != snapshot.count:
+            raise self._invalid_reference_error()
+        return await self._resolve_refreshed(
+            refreshed,
+            max_images=max_images,
+            max_total_bytes=max_total_bytes,
+            per_image_bytes=per_image_bytes,
+            max_pixels=max_pixels,
+            max_edge=max_edge,
+        )
 
     async def resolve(
         self,
@@ -125,7 +262,7 @@ class ReferenceResolver:
         max_pixels: int = DEFAULT_MAX_PIXELS,
         max_edge: int = DEFAULT_MAX_EDGE,
     ) -> list[ReferenceImage]:
-        """Return validated images from the message being directly replied to."""
+        """Compatibility wrapper for snapshotting and resolving an event."""
 
         self._validate_limits(
             max_images=max_images,
@@ -135,123 +272,86 @@ class ReferenceResolver:
             max_edge=max_edge,
         )
 
-        reply = self._first_reply(event)
-        if reply is None:
-            # AstrBot normally retains a Reply with an empty chain when its
-            # first get_msg hydration fails. Keep a narrow raw OneBot fallback
-            # as well: read only the direct reply id, never raw current images.
-            raw_reply_id = self._raw_reply_id(event)
-            if raw_reply_id is None:
-                return []
-            try:
-                refreshed = await self._refresh_sources(event, raw_reply_id)
-            except _RefreshProblem as exc:
-                logger.warning(
-                    "CanvasForge could not inspect a raw quoted message (%s).",
-                    type(exc).__name__,
-                )
-                raise self._invalid_reference_error() from None
-            if not refreshed:
-                return []
-            return await self._resolve_refreshed(
-                refreshed,
-                max_images=max_images,
+        snapshot = await self.snapshot(event)
+        self._check_count(snapshot.count, max_images)
+        try:
+            return await self._resolve_sources(
+                [_ImageSource(source) for source in snapshot.sources],
                 max_total_bytes=max_total_bytes,
                 per_image_bytes=per_image_bytes,
                 max_pixels=max_pixels,
                 max_edge=max_edge,
             )
-
-        chain = reply.chain if isinstance(reply.chain, (list, tuple)) else []
-        direct_images = [
-            item for item in chain if isinstance(item, Image)
-        ]
-
-        if direct_images:
-            self._check_count(len(direct_images), max_images)
-            initial_sources = [
-                _ImageSource(self._component_source(image))
-                for image in direct_images
-            ]
-            try:
-                return await self._resolve_sources(
-                    initial_sources,
-                    max_total_bytes=max_total_bytes,
-                    per_image_bytes=per_image_bytes,
-                    max_pixels=max_pixels,
-                    max_edge=max_edge,
-                )
-            except _RefreshableReferenceProblem as exc:
-                # NapCat's signed URL may already be stale, or AstrBot may have
-                # retained only a local filename. Refresh the quoted message
-                # exactly once, then retry the whole batch.
-                logger.info(
-                    "CanvasForge will refresh a quoted image batch after a "
-                    "validation failure (%s).",
-                    type(exc).__name__,
-                )
-            except _ReferenceLimitProblem as exc:
-                raise CanvasForgeError(
-                    ErrorCode.REFERENCE_LIMIT,
-                    str(exc),
-                ) from None
-            except _ReferenceProblem as exc:
-                # Format, dimensions, animation and byte limits cannot be
-                # repaired by asking NapCat for the same message again.
+        except _RefreshableReferenceProblem as exc:
+            if snapshot.refreshed or not snapshot.sources:
                 raise CanvasForgeError(
                     ErrorCode.REFERENCE_INVALID,
                     str(exc),
                 ) from None
-
-            try:
-                refreshed = await self._refresh_sources(event, reply)
-            except _RefreshProblem as exc:
-                logger.warning(
-                    "CanvasForge could not refresh a quoted image batch (%s).",
-                    type(exc).__name__,
-                )
-                raise self._invalid_reference_error() from None
-
-            # The original Reply chain contained direct Image components.
-            # Never silently turn this request into text-to-image.
-            # Likewise, never continue with only the surviving subset of a
-            # multi-image reply after one source failed and disappeared from
-            # the refreshed OneBot payload.
-            if not refreshed or len(refreshed) != len(direct_images):
-                raise self._invalid_reference_error()
-            return await self._resolve_refreshed(
-                refreshed,
-                max_images=max_images,
-                max_total_bytes=max_total_bytes,
-                per_image_bytes=per_image_bytes,
-                max_pixels=max_pixels,
-                max_edge=max_edge,
+            logger.info(
+                "CanvasForge will refresh a quoted image batch after a "
+                "validation failure (%s).",
+                type(exc).__name__,
             )
+        except _ReferenceLimitProblem as exc:
+            raise CanvasForgeError(
+                ErrorCode.REFERENCE_LIMIT,
+                str(exc),
+            ) from None
+        except _ReferenceProblem as exc:
+            raise CanvasForgeError(
+                ErrorCode.REFERENCE_INVALID,
+                str(exc),
+            ) from None
 
-        # A Reply without a parsed direct Image is ambiguous even when text or
-        # another component survived: AstrBot may drop only the image segment
-        # when constructing it. A successful get_msg response with no direct
-        # image confirms that this is an ordinary text-to-image request. Do
-        # not recurse into any nested reply returned by OneBot.
+        reply = self._first_reply(event)
+        refresh_target: Any = (
+            reply if reply is not None else self._raw_reply_id(event)
+        )
+        if refresh_target is None:
+            raise self._invalid_reference_error()
         try:
-            refreshed = await self._refresh_sources(event, reply)
+            refreshed = await self._refresh_sources(event, refresh_target)
         except _RefreshProblem as exc:
             logger.warning(
-                "CanvasForge could not verify a quoted message without "
-                "parsed images (%s).",
+                "CanvasForge could not refresh a quoted image batch (%s).",
                 type(exc).__name__,
             )
             raise self._invalid_reference_error() from None
+        if len(refreshed) != snapshot.count:
+            raise self._invalid_reference_error()
 
-        if not refreshed:
-            return []
-        return await self._resolve_refreshed(
+        refreshed_snapshot = self._snapshot_from_sources(
             refreshed,
+            refreshed=True,
+        )
+        return await self.resolve_snapshot(
+            refreshed_snapshot,
             max_images=max_images,
             max_total_bytes=max_total_bytes,
             per_image_bytes=per_image_bytes,
             max_pixels=max_pixels,
             max_edge=max_edge,
+        )
+
+    @classmethod
+    def _snapshot_from_sources(
+        cls,
+        sources: Sequence[_ImageSource],
+        *,
+        refreshed: bool,
+        reply_message_id: int | str | None = None,
+    ) -> ReferenceSnapshot:
+        portable_sources: list[str] = []
+        for descriptor in sources:
+            source = cls._first_allowed_source(descriptor.source)
+            if source is None:
+                raise cls._invalid_reference_error()
+            portable_sources.append(source)
+        return ReferenceSnapshot(
+            sources=tuple(portable_sources),
+            refreshed=refreshed,
+            reply_message_id=reply_message_id,
         )
 
     async def _resolve_refreshed(

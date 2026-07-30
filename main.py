@@ -6,6 +6,7 @@ import asyncio
 import copy
 import contextvars
 import json
+import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,8 +18,16 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 import astrbot.api.message_components as Comp
 from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.core.agent.message import (
+    AssistantMessageSegment,
+    CheckpointData,
+    CheckpointMessageSegment,
+    TextPart,
+    bind_checkpoint_messages,
+)
+from astrbot.core.utils.session_lock import session_lock_manager
 
-from .canvasforge.avatar import AvatarResolver, ResolvedAvatar
+from .canvasforge.avatar import AvatarResolver, AvatarTarget, ResolvedAvatar
 from .canvasforge.cache import CacheError, CacheStore
 from .canvasforge.contracts import (
     CanvasForgeError,
@@ -35,6 +44,7 @@ from .canvasforge.provider import (
 from .canvasforge.rate_limit import RequestGate, RequestLease
 from .canvasforge.reference import (
     DEFAULT_PER_IMAGE_BYTES,
+    ReferenceSnapshot,
     ReferenceResolver,
     build_source_metadata,
 )
@@ -43,7 +53,7 @@ from .canvasforge.web_api import WebAPI, normalize_settings
 
 PLUGIN_NAME = "astrbot_plugin_canvasforge"
 PLUGIN_AUTHOR = "YuXya"
-PLUGIN_VERSION = "v0.1.8"
+PLUGIN_VERSION = "v0.1.9"
 PLUGIN_REPOSITORY = "https://github.com/YuXya/astrbot_plugin_canvasforge"
 PLUGIN_DESCRIPTION = (
     "通过 Sub2API 调用 GPT Images，为 NapCat QQ 提供文生图与引用图编辑能力。"
@@ -61,8 +71,26 @@ _LLM_TOOL_NAMES = (
     _TEXT_TO_IMAGE_TOOL_NAME,
     _IMAGE_TO_IMAGE_TOOL_NAME,
 )
-_DEFAULT_COMPLETION_MESSAGE = "图片画好啦～"
+_DEFAULT_COMPLETION_MESSAGE = "图片已生成并发送。"
+_UNDELIVERED_COMPLETION_STATUS = "图片已成功发送，但完成通知未能送达。"
+_COMMAND_PENDING_MESSAGE = "CanvasForge 任务已受理，正在生成，请稍等。"
 _COMPLETION_MESSAGE_MAX_CHARS = 80
+_PREPARED_TIMEOUT_SECONDS = 90
+_GATE_TIMEOUT_SECONDS = 180
+_COMPLETION_TIMEOUT_SECONDS = 20
+_TOOL_FAILURE_EXTRA_KEY = "_canvasforge_terminal_failure_v1"
+
+
+@dataclass(frozen=True, slots=True)
+class _ConversationContext:
+    """Immutable chat context captured before the original Agent finishes."""
+
+    unified_origin: str
+    conversation_id: str | None
+    provider_id: str | None
+    model: str | None
+    system_prompt: str = field(repr=False)
+    contexts: tuple[dict[str, Any], ...] = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,15 +101,18 @@ class _GenerationJob:
     from ``repr`` so diagnostics cannot accidentally disclose them.
     """
 
+    task_id: str
     event: AstrMessageEvent = field(repr=False)
     prompt: str = field(repr=False)
-    requested_mode: str | None
-    avatar_targets: tuple[str, ...] | None = field(repr=False)
-    completion_message: str = field(repr=False)
+    requested_mode: str
+    reference_snapshot: ReferenceSnapshot = field(repr=False)
+    planned_avatars: tuple[AvatarTarget, ...] = field(repr=False)
     base_url: str = field(repr=False)
     api_key: str = field(repr=False)
     settings: Mapping[str, Any] = field(repr=False)
     lease: RequestLease = field(repr=False)
+    conversation: _ConversationContext = field(repr=False)
+    from_llm_tool: bool
 
 
 @register(
@@ -101,10 +132,22 @@ class CanvasForgePlugin(Star):
         self._settings_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
         self._closing = False
+        self._prepared_jobs: dict[int, _GenerationJob] = {}
+        self._prepared_timeout_tasks: dict[int, asyncio.Task[None]] = {}
+        self._prepared_timeout_jobs: dict[
+            asyncio.Task[None],
+            _GenerationJob,
+        ] = {}
+        self._gate_tasks: set[asyncio.Task[None]] = set()
+        self._gate_jobs: dict[asyncio.Task[None], _GenerationJob] = {}
         self._generation_tasks: set[asyncio.Task[None]] = set()
         self._generation_leases: dict[
             asyncio.Task[None],
             RequestLease,
+        ] = {}
+        self._generation_jobs: dict[
+            asyncio.Task[None],
+            _GenerationJob,
         ] = {}
         self._lease_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._termination_task: asyncio.Task[None] | None = None
@@ -147,12 +190,25 @@ class CanvasForgePlugin(Star):
                 type(exc).__name__,
             )
 
+    @filter.on_llm_response()
+    async def start_generation_after_llm_response(
+        self,
+        event: AstrMessageEvent,
+        response: Any,
+    ) -> None:
+        """Open the generation gate after the Agent produced its final reply."""
+
+        # Some AstrBot providers leave the deprecated ``completion_text``
+        # empty while carrying the actual final reply in ``result_chain``.
+        # The gate validates the persisted non-empty assistant reply after
+        # this hook's session lock is released, so always schedule it here.
+        await self._schedule_generation_gate(event)
+
     @filter.llm_tool(name=_TEXT_TO_IMAGE_TOOL_NAME)
     async def canvasforge_text_to_image(
         self,
         event: AstrMessageEvent,
         prompt: str = "",
-        completion_message: str | None = None,
     ) -> str:
         """纯文生图；只用于不代表当前聊天参与者的虚构创作。
 
@@ -163,12 +219,12 @@ class CanvasForgePlugin(Star):
         当前聊天 AI 应自行编写完整提示词，明确人物外貌、表情、动作、关系、
         构图、场景和画风。
 
-        本工具异步执行；accepted=true、completed=false 只表示后台已受理，
-        图片尚未生成或发送。当前 AI 只能说正在生成，不得称已完成或重调工具。
+        本工具异步执行；accepted=true、completed=false 只表示任务已受理。
+        当前 AI 必须回复用户“正在生成，请稍等”，该回复发送并写入会话后插件
+        才会启动生图。不得称已完成、已发送或再次调用 CanvasForge。
 
         Args:
             prompt(string): 由当前聊天 AI 编写的完整文生图提示词。
-            completion_message(string): 按当前人格预写且不描述未见细节的简短完成语，仅在图片成功发送后使用。
         """
 
         return await self._run_llm_tool(
@@ -176,7 +232,6 @@ class CanvasForgePlugin(Star):
             prompt,
             requested_mode="generate",
             avatar_targets=None,
-            completion_message=completion_message,
         )
 
     @filter.llm_tool(name=_IMAGE_TO_IMAGE_TOOL_NAME)
@@ -185,7 +240,6 @@ class CanvasForgePlugin(Star):
         event: AstrMessageEvent,
         prompt: str = "",
         avatar_targets: list[str] | None = None,
-        completion_message: str | None = None,
     ) -> str:
         """使用直接回复图片或自动获取的 QQ 人物头像进行图生图。
 
@@ -207,13 +261,13 @@ class CanvasForgePlugin(Star):
         mention:N 只计算当前群消息中的有效直接 @，会排除机器人唤醒、@全体成员、
         重复 @ 和回复内容中的 @。
 
-        本工具异步执行；accepted=true、completed=false 只表示后台已受理，
-        图片尚未生成或发送。当前 AI 只能说正在生成，不得称已完成或重调工具。
+        本工具异步执行；accepted=true、completed=false 只表示任务已受理。
+        当前 AI 必须回复用户“正在生成，请稍等”，该回复发送并写入会话后插件
+        才会启动生图。不得称已完成、已发送或再次调用 CanvasForge。
 
         Args:
             prompt(string): 由当前聊天 AI 编写的完整图生图提示词。
             avatar_targets(array[string]): 必填；仅回复图传 []；人物头像按 sender、bot、mention:N 的顺序填写。
-            completion_message(string): 按当前人格预写且不描述未见细节的简短完成语，仅在图片成功发送后使用。
         """
 
         return await self._run_llm_tool(
@@ -221,7 +275,6 @@ class CanvasForgePlugin(Star):
             prompt,
             requested_mode="edit",
             avatar_targets=avatar_targets,
-            completion_message=completion_message,
         )
 
     async def _run_llm_tool(
@@ -231,12 +284,15 @@ class CanvasForgePlugin(Star):
         *,
         requested_mode: str,
         avatar_targets: list[str] | None,
-        completion_message: str | None,
     ) -> str:
         """Run either public LLM tool with common error formatting."""
 
+        previous_failure = event.get_extra(_TOOL_FAILURE_EXTRA_KEY)
+        if isinstance(previous_failure, str) and previous_failure:
+            return previous_failure
+
         job: _GenerationJob | None = None
-        handed_off = False
+        registered = False
         try:
             if requested_mode == "edit" and avatar_targets is None:
                 raise CanvasForgeError(
@@ -248,36 +304,49 @@ class CanvasForgePlugin(Star):
                 event,
                 prompt,
                 avatar_targets=avatar_targets,
-                completion_message=completion_message,
                 requested_mode=requested_mode,
+                from_llm_tool=True,
             )
-            await self._start_generation_task(job)
-            handed_off = True
+            await self._register_prepared_job(event, job)
+            registered = True
         except CanvasForgeError as exc:
-            return f"CanvasForge 工具调用失败（{exc.code.value}）：{exc}"
+            result = (
+                "CanvasForge 工具调用状态：accepted=false，finished=true，"
+                f"failed=true，retry_allowed=false，code={exc.code.value}。"
+                f"失败原因：{exc} 当前回合到此结束，不要改用另一个 "
+                "CanvasForge 工具，也不要声称任务正在生成。"
+            )
+            event.set_extra(_TOOL_FAILURE_EXTRA_KEY, result)
+            return result
         except Exception as exc:
             logger.error(
                 "CanvasForge tool failed unexpectedly (%s).",
                 type(exc).__name__,
             )
-            return (
-                "CanvasForge 工具调用失败"
-                f"（{ErrorCode.INTERNAL.value}）："
+            result = (
+                "CanvasForge 工具调用状态：accepted=false，finished=true，"
+                "failed=true，retry_allowed=false，"
+                f"code={ErrorCode.INTERNAL.value}。失败原因："
                 "CanvasForge 处理请求时发生内部错误，请稍后再试。"
+                "当前回合到此结束，不要再次调用 CanvasForge。"
             )
+            event.set_extra(_TOOL_FAILURE_EXTRA_KEY, result)
+            return result
         finally:
             if (
                 job is not None
-                and not handed_off
+                and not registered
                 and not job.lease.finished
             ):
                 await job.lease.release()
 
         return (
-            "CanvasForge 异步任务状态：accepted=true，completed=false。"
-            "后台刚开始生成，图片尚未生成或发送。当前 AI 只能告诉用户"
-            "“正在生成，请稍等”，不得声称“画好了、已完成或已发送”，"
-            "不要重复调用工具。成功后插件会先发送图片，再发送预写完成语。"
+            "CanvasForge 异步任务状态：accepted=true，completed=false，"
+            f"task_id={job.task_id}。图片尚未开始生成。当前 AI 必须告诉用户"
+            "“正在生成，请稍等”；该回复发送并写入会话后，CanvasForge 才会"
+            "启动后台生图。不得声称“画好了、已完成或已发送”，也不要重复"
+            "调用工具。成功后插件会发送图片，再额外调用一次无工具聊天 AI"
+            "主动发送完成通知。"
         )
 
     @filter.command("canvasforge")
@@ -302,6 +371,7 @@ class CanvasForgePlugin(Star):
             job = await self._prepare_generation_job(
                 event,
                 prompt,
+                from_llm_tool=False,
             )
         except CanvasForgeError as exc:
             await self._send_command_text(event, str(exc))
@@ -320,11 +390,11 @@ class CanvasForgePlugin(Star):
         try:
             accepted = await self._send_command_text(
                 event,
-                "CanvasForge 任务已受理，完成后图片会直接发送。",
+                _COMMAND_PENDING_MESSAGE,
             )
             if not accepted:
                 return
-            await self._start_generation_task(job)
+            await self._start_command_gate(job)
             handed_off = True
         except asyncio.CancelledError:
             raise
@@ -349,10 +419,10 @@ class CanvasForgePlugin(Star):
         prompt: str,
         *,
         avatar_targets: list[str] | None = None,
-        completion_message: Any = None,
         requested_mode: str | None = None,
+        from_llm_tool: bool = False,
     ) -> _GenerationJob:
-        """Validate locally, take a settings snapshot and reserve the slot."""
+        """Validate locally, freeze request context and reserve the slot."""
 
         if requested_mode not in (None, "generate", "edit"):
             raise CanvasForgeError(ErrorCode.INTERNAL)
@@ -367,19 +437,73 @@ class CanvasForgePlugin(Star):
             prompt,
             settings["max_prompt_chars"],
         )
-        normalized_completion_message = self._normalize_completion_message(
-            completion_message,
-        )
         if not base_url or not api_key:
             raise CanvasForgeError(ErrorCode.NOT_CONFIGURED)
+        if self._closing:
+            raise CanvasForgeError(
+                ErrorCode.BUSY,
+                "CanvasForge 正在关闭，暂时不能接收新的生图任务。",
+            )
+        if await self._request_gate.is_busy():
+            # Avoid reference-message or profile lookups when another paid
+            # image task already owns the single global slot.  The atomic
+            # acquire below remains authoritative for concurrent arrivals.
+            raise CanvasForgeError(ErrorCode.BUSY)
 
         if avatar_targets is not None and not isinstance(
             avatar_targets,
             list,
         ):
             raise CanvasForgeError(ErrorCode.AVATAR_TARGET_INVALID)
-        frozen_avatar_targets = (
-            tuple(avatar_targets) if avatar_targets is not None else None
+        (
+            _provider_factory,
+            reference_resolver,
+            avatar_resolver,
+        ) = await self._ensure_runtime()
+        if requested_mode == "edit":
+            if avatar_targets and not settings["enable_avatar_references"]:
+                raise CanvasForgeError(ErrorCode.AVATAR_DISABLED)
+            planned_avatars = avatar_resolver.plan(event, avatar_targets)
+        else:
+            planned_avatars = []
+
+        reference_snapshot = await reference_resolver.snapshot(event)
+        has_reply_references = bool(reference_snapshot.sources)
+
+        if requested_mode == "generate" and has_reply_references:
+            raise CanvasForgeError(
+                ErrorCode.MODE_MISMATCH,
+                "当前消息直接回复了图片，应该使用 "
+                "canvasforge_image_to_image 图生图工具；"
+                "本次尚未调用图片接口。",
+            )
+
+        if requested_mode == "edit":
+            if not has_reply_references and not planned_avatars:
+                raise CanvasForgeError(
+                    ErrorCode.MODE_MISMATCH,
+                    "图生图工具至少需要一张直接回复图片或一个人物头像；"
+                    "没有参考图时应该使用 canvasforge_text_to_image。"
+                    "本次尚未调用图片接口。",
+                )
+            resolved_mode = "edit"
+        elif requested_mode == "generate":
+            resolved_mode = "generate"
+        else:
+            resolved_mode = "edit" if has_reply_references else "generate"
+
+        if (
+            len(reference_snapshot.sources) + len(planned_avatars)
+            > settings["max_reference_images"]
+        ):
+            raise CanvasForgeError(
+                ErrorCode.REFERENCE_LIMIT,
+                "引用图片与人物头像的合计数量超过当前限制，请减少后重试。",
+            )
+
+        conversation = await self._capture_conversation_context(
+            event,
+            prefer_authoritative_history=not from_llm_tool,
         )
         user_id = self._event_string(event, "get_sender_id")
         if not user_id:
@@ -398,16 +522,340 @@ class CanvasForgePlugin(Star):
             )
 
         return _GenerationJob(
+            task_id=f"cf_{secrets.token_hex(6)}",
             event=event,
             prompt=normalized_prompt,
-            requested_mode=requested_mode,
-            avatar_targets=frozen_avatar_targets,
-            completion_message=normalized_completion_message,
+            requested_mode=resolved_mode,
+            reference_snapshot=reference_snapshot,
+            planned_avatars=tuple(planned_avatars),
             base_url=base_url,
             api_key=api_key,
             settings=MappingProxyType(dict(settings)),
             lease=lease,
+            conversation=conversation,
+            from_llm_tool=from_llm_tool,
         )
+
+    async def _register_prepared_job(
+        self,
+        event: AstrMessageEvent,
+        job: _GenerationJob,
+    ) -> None:
+        """Hold a leased tool request until the Agent's final reply finishes."""
+
+        event_key = id(event)
+        timeout_task: asyncio.Task[None] | None = None
+        creation_error: Exception | None = None
+        async with self._lifecycle_lock:
+            if self._closing:
+                raise CanvasForgeError(
+                    ErrorCode.BUSY,
+                    "CanvasForge 正在关闭，暂时不能接收新的生图任务。",
+                )
+            if event_key in self._prepared_jobs:
+                raise CanvasForgeError(ErrorCode.BUSY)
+
+            operation = self._expire_prepared_job(event_key, job)
+            try:
+                timeout_task = asyncio.create_task(
+                    operation,
+                    name="canvasforge-prepared-timeout",
+                )
+            except Exception as exc:
+                operation.close()
+                creation_error = exc
+            else:
+                self._prepared_jobs[event_key] = job
+                self._prepared_timeout_tasks[event_key] = timeout_task
+                self._prepared_timeout_jobs[timeout_task] = job
+                timeout_task.add_done_callback(
+                    lambda task, key=event_key: (
+                        self._prepared_timeout_done(key, task)
+                    ),
+                )
+
+        if timeout_task is not None:
+            return
+        logger.error(
+            "CanvasForge could not create the prepared-job watchdog (%s).",
+            type(creation_error).__name__ if creation_error else "unknown",
+        )
+        raise CanvasForgeError(
+            ErrorCode.INTERNAL,
+            "CanvasForge 后台任务未能准备，请稍后再试。",
+        )
+
+    async def _expire_prepared_job(
+        self,
+        event_key: int,
+        job: _GenerationJob,
+    ) -> None:
+        await asyncio.sleep(_PREPARED_TIMEOUT_SECONDS)
+        async with self._lifecycle_lock:
+            if self._prepared_jobs.get(event_key) is not job:
+                return
+            self._prepared_jobs.pop(event_key, None)
+
+        if not job.lease.finished:
+            await job.lease.release()
+        await self._report_terminal_message(
+            job,
+            "CanvasForge 任务未能启动，请重新发起。",
+        )
+
+    def _prepared_timeout_done(
+        self,
+        event_key: int,
+        task: asyncio.Task[None],
+    ) -> None:
+        if self._prepared_timeout_tasks.get(event_key) is task:
+            self._prepared_timeout_tasks.pop(event_key, None)
+        self._prepared_timeout_jobs.pop(task, None)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.error(
+                "CanvasForge prepared-job watchdog failed (%s).",
+                type(exc).__name__,
+            )
+
+    async def _schedule_generation_gate(
+        self,
+        event: AstrMessageEvent,
+    ) -> None:
+        """Move one exact event from prepared state to a session-lock gate."""
+
+        event_key = id(event)
+        watchdog: asyncio.Task[None] | None = None
+        gate_task: asyncio.Task[None] | None = None
+        job: _GenerationJob | None = None
+        creation_error: Exception | None = None
+        async with self._lifecycle_lock:
+            job = self._prepared_jobs.pop(event_key, None)
+            if job is None:
+                return
+            watchdog = self._prepared_timeout_tasks.pop(event_key, None)
+            if watchdog is not None:
+                self._prepared_timeout_jobs.pop(watchdog, None)
+
+            if not self._closing:
+                operation = self._wait_for_agent_reply_and_start(job)
+                try:
+                    gate_task = asyncio.create_task(
+                        operation,
+                        name="canvasforge-generation-gate",
+                    )
+                except Exception as exc:
+                    operation.close()
+                    creation_error = exc
+                else:
+                    self._gate_tasks.add(gate_task)
+                    self._gate_jobs[gate_task] = job
+                    gate_task.add_done_callback(self._gate_task_done)
+
+        if watchdog is not None and not watchdog.done():
+            watchdog.cancel()
+        if gate_task is not None:
+            return
+
+        if job is not None and not job.lease.finished:
+            await job.lease.release()
+        if creation_error is not None:
+            logger.error(
+                "CanvasForge could not create the generation gate (%s).",
+                type(creation_error).__name__,
+            )
+            if job is not None:
+                await self._schedule_terminal_report(
+                    job,
+                    "CanvasForge 任务未能启动，请重新发起。",
+                )
+
+    async def _schedule_terminal_report(
+        self,
+        job: _GenerationJob,
+        text: str,
+    ) -> None:
+        """Report a gate failure only after the current pipeline unlocks."""
+
+        task: asyncio.Task[None] | None = None
+        operation = self._report_terminal_message(job, text)
+        async with self._lifecycle_lock:
+            if not self._closing:
+                try:
+                    task = asyncio.create_task(
+                        operation,
+                        name="canvasforge-terminal-report",
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "CanvasForge could not schedule a terminal report "
+                        "(%s).",
+                        type(exc).__name__,
+                    )
+                else:
+                    self._gate_tasks.add(task)
+                    self._gate_jobs[task] = job
+                    task.add_done_callback(self._gate_task_done)
+        if task is None:
+            operation.close()
+
+    async def _start_command_gate(self, job: _GenerationJob) -> None:
+        """Wait for the command pipeline to unlock before starting work."""
+
+        task: asyncio.Task[None] | None = None
+        creation_error: Exception | None = None
+        operation = self._wait_for_command_pending_and_start(job)
+        async with self._lifecycle_lock:
+            if not self._closing:
+                try:
+                    task = asyncio.create_task(
+                        operation,
+                        name="canvasforge-command-gate",
+                    )
+                except Exception as exc:
+                    creation_error = exc
+                else:
+                    self._gate_tasks.add(task)
+                    self._gate_jobs[task] = job
+                    task.add_done_callback(self._gate_task_done)
+
+        if task is not None:
+            return
+        operation.close()
+        if not job.lease.finished:
+            await job.lease.release()
+        if creation_error is not None:
+            logger.error(
+                "CanvasForge could not create the command gate (%s).",
+                type(creation_error).__name__,
+            )
+            raise CanvasForgeError(
+                ErrorCode.INTERNAL,
+                "CanvasForge 后台任务未能启动，请稍后再试。",
+            )
+        raise CanvasForgeError(
+            ErrorCode.BUSY,
+            "CanvasForge 正在关闭，暂时不能接收新的生图任务。",
+        )
+
+    async def _wait_for_command_pending_and_start(
+        self,
+        job: _GenerationJob,
+    ) -> None:
+        """Persist command pending state and start only after lock release."""
+
+        handed_off = False
+        try:
+            async with asyncio.timeout(_GATE_TIMEOUT_SECONDS):
+                async with session_lock_manager.acquire_lock(
+                    job.conversation.unified_origin,
+                ):
+                    if not await self._record_command_pending_history(
+                        job,
+                        _COMMAND_PENDING_MESSAGE,
+                    ):
+                        raise CanvasForgeError(
+                            ErrorCode.INTERNAL,
+                            "原会话已被重置或无法写入，本次没有启动生图。",
+                        )
+                    await self._start_generation_task(job)
+                    handed_off = True
+        except asyncio.CancelledError:
+            raise
+        except CanvasForgeError as exc:
+            if not job.lease.finished:
+                await job.lease.release()
+            await self._report_terminal_message(
+                job,
+                f"CanvasForge 任务未能启动（{exc.code.value}）：{exc}",
+            )
+        except TimeoutError:
+            if not job.lease.finished:
+                await job.lease.release()
+            await self._report_terminal_message(
+                job,
+                "CanvasForge 任务等待确认超时，本次没有启动生图，请重新发起。",
+            )
+        except Exception as exc:
+            logger.error(
+                "CanvasForge command gate failed unexpectedly (%s).",
+                type(exc).__name__,
+            )
+            if not job.lease.finished:
+                await job.lease.release()
+            await self._report_terminal_message(
+                job,
+                "CanvasForge 任务未能启动，请重新发起。",
+            )
+        finally:
+            if not handed_off and not job.lease.finished:
+                await job.lease.release()
+
+    async def _wait_for_agent_reply_and_start(
+        self,
+        job: _GenerationJob,
+    ) -> None:
+        """Wait until AstrBot has sent and persisted the original Agent reply."""
+
+        handed_off = False
+        try:
+            async with asyncio.timeout(_GATE_TIMEOUT_SECONDS):
+                async with session_lock_manager.acquire_lock(
+                    job.conversation.unified_origin,
+                ):
+                    if not await self._conversation_contains_task(job):
+                        raise CanvasForgeError(
+                            ErrorCode.INTERNAL,
+                            "任务确认信息已失效，本次没有启动生图。",
+                        )
+            await self._start_generation_task(job)
+            handed_off = True
+        except asyncio.CancelledError:
+            raise
+        except CanvasForgeError as exc:
+            if not job.lease.finished:
+                await job.lease.release()
+            await self._report_terminal_message(
+                job,
+                f"CanvasForge 任务未能启动（{exc.code.value}）：{exc}",
+            )
+        except TimeoutError:
+            if not job.lease.finished:
+                await job.lease.release()
+            await self._report_terminal_message(
+                job,
+                "CanvasForge 任务等待确认超时，本次没有启动生图，请重新发起。",
+            )
+        except Exception as exc:
+            logger.error(
+                "CanvasForge generation gate failed unexpectedly (%s).",
+                type(exc).__name__,
+            )
+            if not job.lease.finished:
+                await job.lease.release()
+            await self._report_terminal_message(
+                job,
+                "CanvasForge 任务未能启动，请重新发起。",
+            )
+        finally:
+            if not handed_off and not job.lease.finished:
+                await job.lease.release()
+
+    def _gate_task_done(self, task: asyncio.Task[None]) -> None:
+        self._gate_tasks.discard(task)
+        self._gate_jobs.pop(task, None)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.error(
+                "CanvasForge generation gate escaped its guard (%s).",
+                type(exc).__name__,
+            )
 
     async def _start_generation_task(self, job: _GenerationJob) -> None:
         """Atomically hand one leased job to a strongly held background task."""
@@ -428,6 +876,7 @@ class CanvasForgePlugin(Star):
                 else:
                     self._generation_tasks.add(task)
                     self._generation_leases[task] = job.lease
+                    self._generation_jobs[task] = job
                     task.add_done_callback(self._generation_task_done)
 
         if task is not None:
@@ -454,6 +903,7 @@ class CanvasForgePlugin(Star):
 
         self._generation_tasks.discard(task)
         lease = self._generation_leases.pop(task, None)
+        self._generation_jobs.pop(task, None)
         try:
             task.result()
         except asyncio.CancelledError:
@@ -510,8 +960,8 @@ class CanvasForgePlugin(Star):
         except asyncio.CancelledError:
             raise
         except CanvasForgeError as exc:
-            await self._send_command_text(
-                job.event,
+            await self._report_terminal_message(
+                job,
                 f"CanvasForge 生图失败（{exc.code.value}）：{exc}",
             )
         except Exception as exc:
@@ -519,8 +969,8 @@ class CanvasForgePlugin(Star):
                 "CanvasForge background generation failed unexpectedly (%s).",
                 type(exc).__name__,
             )
-            await self._send_command_text(
-                job.event,
+            await self._report_terminal_message(
+                job,
                 "CanvasForge 处理生图任务时发生内部错误，请稍后再试。",
             )
 
@@ -532,7 +982,6 @@ class CanvasForgePlugin(Star):
 
         event = job.event
         requested_mode = job.requested_mode
-        avatar_targets = job.avatar_targets
         settings = job.settings
         lease = job.lease
         try:
@@ -541,19 +990,6 @@ class CanvasForgePlugin(Star):
                 reference_resolver,
                 avatar_resolver,
             ) = await self._ensure_runtime()
-            if requested_mode == "generate":
-                if await reference_resolver.has_direct_images(event):
-                    raise CanvasForgeError(
-                        ErrorCode.MODE_MISMATCH,
-                        "当前消息直接回复了图片，应该使用 "
-                        "canvasforge_image_to_image 图生图工具；"
-                        "本次尚未调用图片接口。",
-                    )
-                planned_avatars = []
-            else:
-                if avatar_targets and not settings["enable_avatar_references"]:
-                    raise CanvasForgeError(ErrorCode.AVATAR_DISABLED)
-                planned_avatars = avatar_resolver.plan(event, avatar_targets)
 
             # Bind URL and Key only after winning the non-queuing global gate.
             # This request-local provider cannot be changed by a concurrent
@@ -568,16 +1004,17 @@ class CanvasForgePlugin(Star):
             if requested_mode == "generate":
                 references = []
             else:
-                references = await reference_resolver.resolve(
-                    event,
+                references = await reference_resolver.resolve_snapshot(
+                    job.reference_snapshot,
                     max_images=settings["max_reference_images"],
                     max_total_bytes=settings["max_total_reference_mib"] * MIB,
                     per_image_bytes=DEFAULT_PER_IMAGE_BYTES,
                     max_pixels=settings["max_reference_megapixels"] * 1_000_000,
                     max_edge=settings["max_reference_edge"],
+                    event=job.event,
                 )
             if (
-                len(references) + len(planned_avatars)
+                len(references) + len(job.planned_avatars)
                 > settings["max_reference_images"]
             ):
                 raise CanvasForgeError(
@@ -589,7 +1026,7 @@ class CanvasForgePlugin(Star):
             consumed_bytes = sum(len(reference.data) for reference in references)
             resolved_avatars = await avatar_resolver.download(
                 event,
-                planned_avatars,
+                job.planned_avatars,
                 filename_start_index=len(references) + 1,
                 consumed_bytes=consumed_bytes,
                 max_total_bytes=max_total_bytes,
@@ -601,13 +1038,6 @@ class CanvasForgePlugin(Star):
                 resolved.reference for resolved in resolved_avatars
             ]
             references = [*references, *avatar_references]
-            if requested_mode == "edit" and not references:
-                raise CanvasForgeError(
-                    ErrorCode.MODE_MISMATCH,
-                    "图生图工具至少需要一张直接回复图片或一个人物头像；"
-                    "没有参考图时应该使用 canvasforge_text_to_image。"
-                    "本次尚未调用图片接口。",
-                )
             request_prompt = self._with_avatar_mapping(
                 job.prompt,
                 resolved_avatars,
@@ -622,7 +1052,7 @@ class CanvasForgePlugin(Star):
                 request_prompt,
                 settings["max_prompt_chars"],
             )
-            mode = requested_mode or ("edit" if references else "generate")
+            mode = requested_mode
             reply_reference_count = len(references) - len(resolved_avatars)
             logger.info(
                 "CanvasForge prepared an Images API request "
@@ -664,14 +1094,9 @@ class CanvasForgePlugin(Star):
                 source_metadata=source_metadata,
             )
 
-            await self._send_generated_image_and_commit(
-                event,
+            await self._finalize_success(
+                job,
                 image,
-                lease,
-            )
-            await self._send_completion_message(
-                event,
-                job.completion_message,
             )
             return mode
         finally:
@@ -680,9 +1105,8 @@ class CanvasForgePlugin(Star):
 
     async def _send_generated_image_and_commit(
         self,
-        event: AstrMessageEvent,
+        job: _GenerationJob,
         image: GeneratedImage,
-        lease: RequestLease,
     ) -> None:
         """Finish QQ delivery and its cooldown commit before cancellation.
 
@@ -718,7 +1142,8 @@ class CanvasForgePlugin(Star):
             raise CanvasForgeError(ErrorCode.SEND_FAILED) from None
 
         send_task = asyncio.ensure_future(
-            event.send(
+            self._send_active_message(
+                job.conversation.unified_origin,
                 MessageChain(chain=[image_component]),
             ),
         )
@@ -733,7 +1158,7 @@ class CanvasForgePlugin(Star):
                 break
 
         try:
-            send_task.result()
+            sent = send_task.result()
         except asyncio.CancelledError as exc:
             if cancellation is None:
                 cancellation = exc
@@ -742,15 +1167,238 @@ class CanvasForgePlugin(Star):
             if cancellation is not None:
                 raise cancellation from None
             raise CanvasForgeError(ErrorCode.SEND_FAILED) from None
+        if not sent:
+            raise CanvasForgeError(ErrorCode.SEND_FAILED)
 
         try:
-            await lease.commit()
+            await job.lease.commit()
         except asyncio.CancelledError as exc:
             if cancellation is None:
                 cancellation = exc
 
         if cancellation is not None:
             raise cancellation
+
+    async def _finalize_success(
+        self,
+        job: _GenerationJob,
+        image: GeneratedImage,
+    ) -> None:
+        """Finish an already generated image without leaving a half-state."""
+
+        operation = self._finalize_success_inner(job, image)
+        task = asyncio.create_task(
+            operation,
+            name="canvasforge-success-finalizer",
+        )
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+
+        try:
+            task.result()
+        except BaseException:
+            if cancellation is not None:
+                raise cancellation from None
+            raise
+        if cancellation is not None:
+            raise cancellation
+
+    async def _finalize_success_inner(
+        self,
+        job: _GenerationJob,
+        image: GeneratedImage,
+    ) -> None:
+        """Serialize image delivery, one completion LLM call and history."""
+
+        async with session_lock_manager.acquire_lock(
+            job.conversation.unified_origin,
+        ):
+            await self._send_generated_image_and_commit(job, image)
+
+            completion_message = await self._generate_completion_message(job)
+            completion_sent = False
+            try:
+                completion_sent = await self._send_active_message(
+                    job.conversation.unified_origin,
+                    MessageChain(chain=[Comp.Plain(completion_message)]),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "CanvasForge could not send the AI completion message "
+                    "(%s); the generated image remains delivered.",
+                    type(exc).__name__,
+                )
+
+            history_text = (
+                completion_message
+                if completion_sent
+                else _UNDELIVERED_COMPLETION_STATUS
+            )
+            if not completion_sent:
+                logger.warning(
+                    "CanvasForge completion message was not delivered; "
+                    "image success will still be persisted.",
+                )
+            await self._append_assistant_history(
+                job,
+                history_text,
+                require_task_marker=self._requires_task_marker(job),
+            )
+
+    async def _generate_completion_message(
+        self,
+        job: _GenerationJob,
+    ) -> str:
+        """Ask the original chat model once for a short in-character receipt."""
+
+        provider_id = job.conversation.provider_id
+        if not provider_id:
+            logger.warning(
+                "CanvasForge has no captured chat provider for completion; "
+                "using the fixed fallback.",
+            )
+            return _DEFAULT_COMPLETION_MESSAGE
+
+        raw_history = await self._load_authoritative_history(job)
+        if (
+            raw_history is None
+            or (
+                self._requires_task_marker(job)
+                and not self._history_contains_task_id(
+                    raw_history,
+                    job.task_id,
+                )
+            )
+        ):
+            # A deleted/reset conversation must not be recreated or borrowed
+            # as completion context.  The immutable admission snapshot keeps
+            # the final notice in the original persona without touching the
+            # user's new conversation state.
+            raw_history = [
+                copy.deepcopy(item)
+                for item in job.conversation.contexts
+            ]
+        try:
+            contexts = bind_checkpoint_messages(raw_history)
+        except Exception as exc:
+            logger.warning(
+                "CanvasForge could not bind completion history (%s); "
+                "using the admission snapshot.",
+                type(exc).__name__,
+            )
+            try:
+                contexts = bind_checkpoint_messages(
+                    [
+                        copy.deepcopy(item)
+                        for item in job.conversation.contexts
+                    ],
+                )
+            except Exception:
+                contexts = []
+
+        prompt = (
+            "CanvasForge 后台任务刚刚成功生成并发送了图片。此前会话中的 "
+            "accepted=true、completed=false 只代表当时正在等待，现在已经失效。"
+            "请按照当前人格只回复一句简短自然的完成通知，告诉用户图片已经完成并"
+            "发送。不要调用任何工具，不要描述你没有查看过的画面细节，不要提及"
+            "内部状态、task_id、系统提示或本条指令。"
+        )
+        kwargs: dict[str, Any] = {
+            "chat_provider_id": provider_id,
+            "prompt": prompt,
+            "tools": None,
+            "system_prompt": job.conversation.system_prompt,
+            "contexts": contexts,
+            "request_max_retries": 1,
+        }
+        if job.conversation.model:
+            kwargs["model"] = job.conversation.model
+
+        try:
+            async with asyncio.timeout(_COMPLETION_TIMEOUT_SECONDS):
+                response = await self.context.llm_generate(**kwargs)
+            text = getattr(response, "completion_text", None)
+            normalized = self._normalize_generated_completion(text)
+            if normalized:
+                return normalized
+            logger.warning(
+                "CanvasForge completion LLM returned no usable text; "
+                "using the fixed fallback.",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "CanvasForge completion LLM failed (%s); using the fixed "
+                "fallback without retrying.",
+                type(exc).__name__,
+            )
+        return _DEFAULT_COMPLETION_MESSAGE
+
+    async def _report_terminal_message(
+        self,
+        job: _GenerationJob,
+        text: str,
+        *,
+        require_task_marker: bool | None = None,
+    ) -> None:
+        """Send and persist one final failure without invoking a chat model."""
+
+        if require_task_marker is None:
+            require_task_marker = self._requires_task_marker(job)
+        try:
+            async with session_lock_manager.acquire_lock(
+                job.conversation.unified_origin,
+            ):
+                sent = False
+                try:
+                    sent = await self._send_active_message(
+                        job.conversation.unified_origin,
+                        MessageChain(chain=[Comp.Plain(text)]),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "CanvasForge could not deliver a terminal message "
+                        "(%s).",
+                        type(exc).__name__,
+                    )
+                history_text = (
+                    text
+                    if sent
+                    else "CanvasForge 后台任务已经失败并结束，但失败通知未能送达。"
+                )
+                await self._append_assistant_history(
+                    job,
+                    history_text,
+                    require_task_marker=require_task_marker,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "CanvasForge could not finalize a terminal state (%s).",
+                type(exc).__name__,
+            )
+
+    async def _send_active_message(
+        self,
+        unified_origin: str,
+        chain: MessageChain,
+    ) -> bool:
+        sent = await self.context.send_message(unified_origin, chain)
+        return bool(sent)
+
+    @staticmethod
+    def _normalize_generated_completion(value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        normalized = " ".join(value.split())
+        return normalized[:_COMPLETION_MESSAGE_MAX_CHARS]
 
     async def _cache_generated_image(
         self,
@@ -1041,16 +1689,396 @@ class CanvasForgePlugin(Star):
             )
         return normalized
 
-    @staticmethod
-    def _normalize_completion_message(value: Any) -> str:
-        """Return one bounded plain-text completion line with a safe fallback."""
+    async def _capture_conversation_context(
+        self,
+        event: AstrMessageEvent,
+        *,
+        prefer_authoritative_history: bool = False,
+    ) -> _ConversationContext:
+        """Freeze the exact chat/provider identity used by this request."""
 
-        if not isinstance(value, str):
-            return _DEFAULT_COMPLETION_MESSAGE
-        normalized = " ".join(value.split())
-        if not normalized:
-            return _DEFAULT_COMPLETION_MESSAGE
-        return normalized[:_COMPLETION_MESSAGE_MAX_CHARS]
+        unified_origin = getattr(event, "unified_msg_origin", "")
+        if not isinstance(unified_origin, str) or not unified_origin.strip():
+            raise CanvasForgeError(
+                ErrorCode.INTERNAL,
+                "无法识别当前会话，任务没有启动。",
+            )
+        unified_origin = unified_origin.strip()
+
+        request = event.get_extra("provider_request")
+        conversation = getattr(request, "conversation", None)
+        conversation_id = getattr(conversation, "cid", None)
+        if not isinstance(conversation_id, str) or not conversation_id:
+            conversation_id = None
+
+        system_prompt = getattr(request, "system_prompt", "")
+        if not isinstance(system_prompt, str):
+            system_prompt = ""
+        model = getattr(request, "model", None)
+        if not isinstance(model, str) or not model.strip():
+            model = None
+        else:
+            model = model.strip()
+
+        contexts = self._copy_history_items(getattr(request, "contexts", None))
+        manager = getattr(self.context, "conversation_manager", None)
+        if manager is not None:
+            if conversation_id is None:
+                try:
+                    conversation_id = await manager.get_curr_conversation_id(
+                        unified_origin,
+                    )
+                except Exception:
+                    conversation_id = None
+            if conversation_id:
+                try:
+                    current = await manager.get_conversation(
+                        unified_origin,
+                        conversation_id,
+                    )
+                except Exception:
+                    current = None
+                if current is not None:
+                    conversation = current
+                    if prefer_authoritative_history or not contexts:
+                        contexts = tuple(
+                            self._parse_history(
+                                getattr(current, "history", ""),
+                            ),
+                        )
+
+        if not system_prompt:
+            system_prompt = await self._resolve_persona_prompt(
+                unified_origin,
+                conversation,
+                platform_name=self._event_string(
+                    event,
+                    "get_platform_name",
+                ),
+            )
+
+        provider_id: str | None = None
+        try:
+            provider_id = await self.context.get_current_chat_provider_id(
+                unified_origin,
+            )
+        except Exception:
+            provider_id = None
+        if not isinstance(provider_id, str) or not provider_id.strip():
+            provider_id = None
+        else:
+            provider_id = provider_id.strip()
+
+        return _ConversationContext(
+            unified_origin=unified_origin,
+            conversation_id=conversation_id,
+            provider_id=provider_id,
+            model=model,
+            system_prompt=system_prompt,
+            contexts=contexts,
+        )
+
+    async def _resolve_persona_prompt(
+        self,
+        unified_origin: str,
+        conversation: Any,
+        *,
+        platform_name: str,
+    ) -> str:
+        """Best-effort persona prompt for the direct command entry point."""
+
+        manager = getattr(self.context, "persona_manager", None)
+        if manager is None:
+            return ""
+        persona_id = getattr(conversation, "persona_id", None)
+        selected_resolver = getattr(
+            manager,
+            "resolve_selected_persona",
+            None,
+        )
+        if callable(selected_resolver):
+            provider_settings: dict[str, Any] = {}
+            config_getter = getattr(self.context, "get_config", None)
+            if callable(config_getter):
+                try:
+                    config = config_getter(umo=unified_origin)
+                    if isinstance(config, Mapping):
+                        configured = config.get("provider_settings", {})
+                        if isinstance(configured, Mapping):
+                            provider_settings = dict(configured)
+                except Exception:
+                    provider_settings = {}
+            try:
+                resolved = await selected_resolver(
+                    umo=unified_origin,
+                    conversation_persona_id=(
+                        persona_id
+                        if isinstance(persona_id, str)
+                        else None
+                    ),
+                    platform_name=platform_name,
+                    provider_settings=provider_settings,
+                )
+                persona = (
+                    resolved[1]
+                    if isinstance(resolved, tuple) and len(resolved) >= 2
+                    else None
+                )
+                if isinstance(persona, Mapping):
+                    prompt = persona.get("prompt")
+                    if isinstance(prompt, str):
+                        return prompt
+            except Exception:
+                pass
+        try:
+            resolver = getattr(manager, "get_persona_v3_by_id", None)
+            persona = resolver(persona_id) if callable(resolver) else None
+            if persona is None:
+                default_resolver = getattr(
+                    manager,
+                    "get_default_persona_v3",
+                    None,
+                )
+                if callable(default_resolver):
+                    persona = await default_resolver(unified_origin)
+            if isinstance(persona, Mapping):
+                prompt = persona.get("prompt")
+                if isinstance(prompt, str):
+                    return prompt
+        except Exception:
+            pass
+
+        if isinstance(persona_id, str) and persona_id:
+            try:
+                legacy = await manager.get_persona(persona_id)
+                prompt = getattr(legacy, "system_prompt", "")
+                if isinstance(prompt, str):
+                    return prompt
+            except Exception:
+                pass
+        return ""
+
+    @staticmethod
+    def _copy_history_items(value: Any) -> tuple[dict[str, Any], ...]:
+        if not isinstance(value, (list, tuple)):
+            return ()
+        copied: list[dict[str, Any]] = []
+        for item in value:
+            if isinstance(item, Mapping):
+                copied.append(copy.deepcopy(dict(item)))
+                continue
+            model_dump = getattr(item, "model_dump", None)
+            if callable(model_dump):
+                try:
+                    dumped = model_dump()
+                except Exception:
+                    continue
+                if isinstance(dumped, Mapping):
+                    copied.append(copy.deepcopy(dict(dumped)))
+        return tuple(copied)
+
+    @staticmethod
+    def _parse_history(value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, str) or not value:
+            return []
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(parsed, list):
+            return []
+        return [
+            copy.deepcopy(dict(item))
+            for item in parsed
+            if isinstance(item, Mapping)
+        ]
+
+    async def _load_authoritative_history(
+        self,
+        job: _GenerationJob,
+    ) -> list[dict[str, Any]] | None:
+        conversation_id = job.conversation.conversation_id
+        manager = getattr(self.context, "conversation_manager", None)
+        if not conversation_id or manager is None:
+            return None
+        try:
+            conversation = await manager.get_conversation(
+                job.conversation.unified_origin,
+                conversation_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "CanvasForge could not load the original conversation (%s).",
+                type(exc).__name__,
+            )
+            return None
+        if conversation is None:
+            return None
+        return self._parse_history(getattr(conversation, "history", ""))
+
+    async def _record_command_pending_history(
+        self,
+        job: _GenerationJob,
+        text: str,
+    ) -> bool:
+        """Persist the command wait reply and a reset-detecting checkpoint."""
+
+        conversation_id = job.conversation.conversation_id
+        manager = getattr(self.context, "conversation_manager", None)
+        if not conversation_id or manager is None:
+            return True
+        try:
+            conversation = await manager.get_conversation(
+                job.conversation.unified_origin,
+                conversation_id,
+            )
+            if conversation is None:
+                return False
+            history = self._parse_history(
+                getattr(conversation, "history", ""),
+            )
+            admission_history = [
+                copy.deepcopy(item)
+                for item in job.conversation.contexts
+            ]
+            if history[: len(admission_history)] != admission_history:
+                return False
+            history.append(
+                AssistantMessageSegment(
+                    content=[TextPart(text=text)],
+                ).model_dump(),
+            )
+            # AstrBot binds a checkpoint to the message immediately before
+            # it.  Keeping the marker after the visible pending reply lets
+            # bind_checkpoint_messages retain that reply while raw-history
+            # checks can still detect a later /new or in-place reset.
+            history.append(
+                CheckpointMessageSegment(
+                    content=CheckpointData(id=job.task_id),
+                ).model_dump(),
+            )
+            await manager.update_conversation(
+                job.conversation.unified_origin,
+                conversation_id=conversation_id,
+                history=history,
+                token_usage=0,
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "CanvasForge could not persist the command pending state "
+                "(%s).",
+                type(exc).__name__,
+            )
+            return False
+
+    @staticmethod
+    def _requires_task_marker(job: _GenerationJob) -> bool:
+        return job.conversation.conversation_id is not None
+
+    async def _conversation_contains_task(
+        self,
+        job: _GenerationJob,
+    ) -> bool:
+        if not job.from_llm_tool or job.conversation.conversation_id is None:
+            return True
+        history = await self._load_authoritative_history(job)
+        return history is not None and self._history_contains_task_reply(
+            history,
+            job.task_id,
+        )
+
+    @classmethod
+    def _history_contains_task_reply(
+        cls,
+        history: list[dict[str, Any]],
+        task_id: str,
+    ) -> bool:
+        """Confirm both the tool result and a later non-empty AI reply."""
+
+        marker_index: int | None = None
+        for index, item in enumerate(history):
+            try:
+                serialized = json.dumps(item, ensure_ascii=False)
+            except (TypeError, ValueError):
+                continue
+            if task_id in serialized:
+                marker_index = index
+                break
+        if marker_index is None:
+            return False
+
+        for item in history[marker_index + 1 :]:
+            if item.get("role") != "assistant":
+                continue
+            content = item.get("content")
+            if isinstance(content, str) and content.strip():
+                return True
+            if isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, Mapping):
+                        continue
+                    text = part.get("text")
+                    if isinstance(text, str) and text.strip():
+                        return True
+        return False
+
+    @staticmethod
+    def _history_contains_task_id(
+        history: list[dict[str, Any]],
+        task_id: str,
+    ) -> bool:
+        try:
+            serialized = json.dumps(history, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return False
+        return task_id in serialized
+
+    async def _append_assistant_history(
+        self,
+        job: _GenerationJob,
+        text: str,
+        *,
+        require_task_marker: bool,
+    ) -> bool:
+        conversation_id = job.conversation.conversation_id
+        manager = getattr(self.context, "conversation_manager", None)
+        if not conversation_id or manager is None:
+            return False
+        try:
+            conversation = await manager.get_conversation(
+                job.conversation.unified_origin,
+                conversation_id,
+            )
+            if conversation is None:
+                return False
+            history = self._parse_history(
+                getattr(conversation, "history", ""),
+            )
+            if require_task_marker and not self._history_contains_task_id(
+                history,
+                job.task_id,
+            ):
+                return False
+            history.append(
+                AssistantMessageSegment(
+                    content=[TextPart(text=text)],
+                ).model_dump(),
+            )
+            await manager.update_conversation(
+                job.conversation.unified_origin,
+                conversation_id=conversation_id,
+                history=history,
+                token_usage=0,
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "CanvasForge could not persist the terminal assistant state "
+                "(%s).",
+                type(exc).__name__,
+            )
+            return False
 
     @staticmethod
     def _with_avatar_mapping(
@@ -1127,21 +2155,7 @@ class CanvasForgePlugin(Star):
                     raise TypeError("tool properties are unavailable")
                 if not isinstance(properties.get("prompt"), dict):
                     raise TypeError("prompt schema is unavailable")
-                completion_schema = properties.get("completion_message")
-                if not isinstance(completion_schema, dict):
-                    completion_schema = {}
-                    properties["completion_message"] = completion_schema
-                completion_schema.update(
-                    {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": _COMPLETION_MESSAGE_MAX_CHARS,
-                        "description": (
-                            "按当前人格预写且不描述未见细节的简短完成语；"
-                            "仅在图片成功发送后由插件发送。"
-                        ),
-                    },
-                )
+                properties.pop("completion_message", None)
 
                 if tool_name == _IMAGE_TO_IMAGE_TOOL_NAME:
                     avatar_schema = properties.get("avatar_targets")
@@ -1163,10 +2177,9 @@ class CanvasForgePlugin(Star):
                     required = [
                         "prompt",
                         "avatar_targets",
-                        "completion_message",
                     ]
                 else:
-                    required = ["prompt", "completion_message"]
+                    required = ["prompt"]
 
                 parameters["required"] = required
                 parameters["additionalProperties"] = False
@@ -1369,26 +2382,6 @@ class CanvasForgePlugin(Star):
         if cancellation is not None:
             raise cancellation
 
-    async def _send_completion_message(
-        self,
-        event: AstrMessageEvent,
-        completion_message: str,
-    ) -> None:
-        """Send one plain completion line without reversing image success."""
-
-        try:
-            await event.send(
-                MessageChain(chain=[Comp.Plain(completion_message)]),
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning(
-                "CanvasForge could not send the completion message (%s); "
-                "the generated image remains successfully delivered.",
-                type(exc).__name__,
-            )
-
     async def terminate(self) -> None:
         """Block admission, drain jobs, then close the shared HTTP session."""
 
@@ -1407,19 +2400,39 @@ class CanvasForgePlugin(Star):
     async def _terminate_resources(self) -> None:
         self._web_api.deactivate()
         async with self._lifecycle_lock:
-            tasks = tuple(self._generation_tasks)
-            leases = tuple(
-                lease
-                for task in tasks
-                if (lease := self._generation_leases.get(task)) is not None
+            prepared_jobs = tuple(self._prepared_jobs.values())
+            prepared_timeout_jobs = tuple(
+                self._prepared_timeout_jobs.values(),
             )
+            prepared_tasks = tuple(self._prepared_timeout_tasks.values())
+            gate_tasks = tuple(self._gate_tasks)
+            generation_tasks = tuple(self._generation_tasks)
+            gate_jobs = tuple(self._gate_jobs.values())
+            generation_jobs = tuple(self._generation_jobs.values())
+            self._prepared_jobs.clear()
+            self._prepared_timeout_tasks.clear()
+            self._prepared_timeout_jobs.clear()
+
+        tasks = (*prepared_tasks, *gate_tasks, *generation_tasks)
+        jobs = (
+            *prepared_jobs,
+            *prepared_timeout_jobs,
+            *gate_jobs,
+            *generation_jobs,
+        )
 
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-        for lease in leases:
+        seen_leases: set[int] = set()
+        for job in jobs:
+            lease = job.lease
+            lease_identity = id(lease)
+            if lease_identity in seen_leases:
+                continue
+            seen_leases.add(lease_identity)
             if lease.finished:
                 continue
             try:

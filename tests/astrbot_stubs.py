@@ -7,6 +7,7 @@ importing and exercising CanvasForge.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import tempfile
 import types
@@ -46,6 +47,103 @@ class FakeMessageChain:
 class FakePlain:
     def __init__(self, text: str) -> None:
         self.text = text
+
+
+class FakeTextPart:
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.is_temp = False
+
+    def mark_as_temp(self) -> "FakeTextPart":
+        self.is_temp = True
+        return self
+
+    def model_dump(self) -> dict[str, str]:
+        return {
+            "type": "text",
+            "text": self.text,
+        }
+
+
+class FakeAssistantMessageSegment:
+    def __init__(self, content: list[Any] | None = None, **values: Any) -> None:
+        self.role = "assistant"
+        self.content = list(content or [])
+        for key, value in values.items():
+            setattr(self, key, value)
+
+    def model_dump(self) -> dict[str, Any]:
+        content: list[Any] = []
+        for part in self.content:
+            dumper = getattr(part, "model_dump", None)
+            content.append(dumper() if callable(dumper) else part)
+        return {
+            "role": self.role,
+            "content": content,
+        }
+
+
+class FakeCheckpointData:
+    def __init__(self, id: str) -> None:
+        self.id = id
+
+    def model_dump(self) -> dict[str, str]:
+        return {"id": self.id}
+
+
+class FakeCheckpointMessageSegment:
+    def __init__(self, content: FakeCheckpointData) -> None:
+        self.role = "_checkpoint"
+        self.content = content
+
+    def model_dump(self) -> dict[str, Any]:
+        return {
+            "role": self.role,
+            "content": self.content.model_dump(),
+        }
+
+
+class FakeLLMResponse:
+    def __init__(
+        self,
+        completion_text: str = "",
+        *,
+        role: str = "assistant",
+    ) -> None:
+        self.completion_text = completion_text
+        self.role = role
+
+
+class FakeSessionLockManager:
+    """Per-UMO locks matching AstrBot's public session lock contract."""
+
+    def __init__(self) -> None:
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def acquire_lock(self, unified_msg_origin: str) -> asyncio.Lock:
+        return self._locks.setdefault(
+            unified_msg_origin,
+            asyncio.Lock(),
+        )
+
+    def reset(self) -> None:
+        self._locks.clear()
+
+
+fake_session_lock_manager = FakeSessionLockManager()
+
+
+def fake_bind_checkpoint_messages(
+    history: list[Any],
+) -> list[Any]:
+    return [
+        item
+        for item in history
+        if not (
+            isinstance(item, dict)
+            and item.get("role") == "_checkpoint"
+        )
+    ]
 
 
 class FakeImage:
@@ -99,6 +197,14 @@ class FakeFilter:
     def command(*_args: Any, **_kwargs: Any):
         return lambda value: value
 
+    @staticmethod
+    def on_llm_request(*_args: Any, **_kwargs: Any):
+        return lambda value: value
+
+    @staticmethod
+    def on_llm_response(*_args: Any, **_kwargs: Any):
+        return lambda value: value
+
 
 class FakeStar:
     def __init__(self, context: Any, config: Any) -> None:
@@ -147,6 +253,31 @@ def install_astrbot_stubs() -> None:
     star.StarTools = FakeStarTools
     star.register = _register
 
+    core = types.ModuleType("astrbot.core")
+    core.__path__ = []
+
+    agent = types.ModuleType("astrbot.core.agent")
+    agent.__path__ = []
+
+    agent_message = types.ModuleType("astrbot.core.agent.message")
+    agent_message.TextPart = FakeTextPart
+    agent_message.AssistantMessageSegment = FakeAssistantMessageSegment
+    agent_message.CheckpointData = FakeCheckpointData
+    agent_message.CheckpointMessageSegment = FakeCheckpointMessageSegment
+    agent_message.bind_checkpoint_messages = fake_bind_checkpoint_messages
+
+    provider = types.ModuleType("astrbot.core.provider")
+    provider.__path__ = []
+
+    provider_entities = types.ModuleType("astrbot.core.provider.entities")
+    provider_entities.LLMResponse = FakeLLMResponse
+
+    utils = types.ModuleType("astrbot.core.utils")
+    utils.__path__ = []
+
+    session_lock = types.ModuleType("astrbot.core.utils.session_lock")
+    session_lock.session_lock_manager = fake_session_lock_manager
+
     web = types.ModuleType("astrbot.api.web")
     web.request = FakeRequest
     web.json_response = lambda payload, status_code=200, headers=None: FakeResponse(
@@ -169,6 +300,13 @@ def install_astrbot_stubs() -> None:
         "astrbot.api.event": event,
         "astrbot.api.message_components": components,
         "astrbot.api.star": star,
+        "astrbot.core": core,
+        "astrbot.core.agent": agent,
+        "astrbot.core.agent.message": agent_message,
+        "astrbot.core.provider": provider,
+        "astrbot.core.provider.entities": provider_entities,
+        "astrbot.core.utils": utils,
+        "astrbot.core.utils.session_lock": session_lock,
         "astrbot.api.web": web,
     }
     sys.modules.update(modules)

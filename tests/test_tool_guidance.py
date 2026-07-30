@@ -71,7 +71,7 @@ class ToolGuidanceTests(unittest.TestCase):
             with self.subTest(required_text=required_text):
                 self.assertIn(required_text, image_description)
 
-    def test_tools_explain_background_pending_state_and_completion_message(
+    def test_tools_explain_deferred_background_generation(
         self,
     ) -> None:
         descriptions = (
@@ -92,23 +92,8 @@ class ToolGuidanceTests(unittest.TestCase):
         for description in descriptions:
             with self.subTest(description=description):
                 self.assertIn("异步", description)
-                _assert_contains_one(
-                    self,
-                    description,
-                    ("后台受理", "后台已受理"),
-                )
-                self.assertIn("completion_message", description)
-                self.assertIn("尚未", description)
-                _assert_contains_one(
-                    self,
-                    description,
-                    ("正在生成", "请稍等"),
-                )
-                _assert_contains_one(
-                    self,
-                    description,
-                    ("画好了", "已完成", "已经完成", "已发送"),
-                )
+                self.assertIn("completed=false", description)
+                self.assertIn("回复发送并写入会话后", description)
 
     def test_image_tool_locks_all_reference_people_identity_features(
         self,
@@ -257,7 +242,7 @@ class ToolGuidanceTests(unittest.TestCase):
             ),
         )
 
-    def test_llm_tool_schema_requires_bounded_completion_message(self) -> None:
+    def test_llm_tool_schema_requires_only_public_parameters(self) -> None:
         tools = [
             SimpleNamespace(
                 name="canvasforge_text_to_image",
@@ -265,7 +250,6 @@ class ToolGuidanceTests(unittest.TestCase):
                     "type": "object",
                     "properties": {
                         "prompt": {"type": "string"},
-                        "completion_message": {},
                     },
                 },
             ),
@@ -276,7 +260,6 @@ class ToolGuidanceTests(unittest.TestCase):
                     "properties": {
                         "prompt": {"type": "string"},
                         "avatar_targets": {"type": "array"},
-                        "completion_message": {},
                     },
                 },
             ),
@@ -290,18 +273,24 @@ class ToolGuidanceTests(unittest.TestCase):
 
         plugin._configure_llm_tool_schemas()
 
+        expected = {
+            "canvasforge_text_to_image": {"prompt"},
+            "canvasforge_image_to_image": {
+                "prompt",
+                "avatar_targets",
+            },
+        }
         for tool in tools:
             with self.subTest(tool=tool.name):
                 schema = tool.parameters
-                self.assertIn("completion_message", schema["required"])
-                completion_schema = schema["properties"][
-                    "completion_message"
-                ]
                 self.assertEqual(
-                    "string",
-                    completion_schema["type"],
+                    expected[tool.name],
+                    set(schema["required"]),
                 )
-                self.assertEqual(80, completion_schema["maxLength"])
+                self.assertEqual(
+                    expected[tool.name],
+                    set(schema["properties"]),
+                )
                 self.assertFalse(schema["additionalProperties"])
 
 
