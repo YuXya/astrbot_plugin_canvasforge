@@ -529,6 +529,7 @@ class BackgroundGenerationTests(unittest.IsolatedAsyncioTestCase):
 
         result = await turn.result()
         self.assertIn("accepted=true", result)
+        self.assertIn("completed=false", result)
         self.assertEqual(0, self.provider.calls)
         self.assertTrue(await self.plugin._request_gate.is_busy())
         self.assertTrue(self.plugin._prepared_jobs)
@@ -873,6 +874,8 @@ class BackgroundGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(self.context.llm_calls))
         llm_call = self.context.llm_calls[0]
         self.assertIsNone(llm_call["tools"])
+        self.assertIn("已成功发送图片", llm_call["prompt"])
+        self.assertIn("等待状态已经结束", llm_call["prompt"])
         self.assertEqual(1, llm_call["request_max_retries"])
         self.assertEqual("chat-provider", llm_call["chat_provider_id"])
         self.assertEqual(

@@ -62,9 +62,9 @@ class UpdateSurfaceRemovalTests(unittest.TestCase):
         metadata = (ROOT / "metadata.yaml").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-        self.assertIn('PLUGIN_VERSION = "v0.1.9"', main)
-        self.assertRegex(metadata, r"(?m)^version:\s*v0\.1\.9\s*$")
-        self.assertIn("v0.1.9", readme)
+        self.assertIn('PLUGIN_VERSION = "v0.1.10"', main)
+        self.assertRegex(metadata, r"(?m)^version:\s*v0\.1\.10\s*$")
+        self.assertIn("v0.1.10", readme)
         self.assertIn(
             "https://github.com/YuXya/astrbot_plugin_canvasforge",
             readme,
