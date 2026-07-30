@@ -37,10 +37,14 @@ class FakeEvent:
         *,
         sender_id: str = "10001",
         send_fails: bool = False,
+        image_send_fails: bool = False,
+        plain_send_fails: bool = False,
     ) -> None:
         self.raw_message = raw_message
         self.sender_id = sender_id
         self.send_fails = send_fails
+        self.image_send_fails = image_send_fails
+        self.plain_send_fails = plain_send_fails
         self.sent: list[object] = []
         self.stopped = False
 
@@ -65,6 +69,11 @@ class FakeEvent:
     async def send(self, message) -> None:
         if self.send_fails:
             raise RuntimeError("simulated send failure")
+        component = message.chain[0]
+        if self.image_send_fails and isinstance(component, main.Comp.Image):
+            raise RuntimeError("simulated image send failure")
+        if self.plain_send_fails and isinstance(component, main.Comp.Plain):
+            raise RuntimeError("simulated plain send failure")
         self.sent.append(message)
 
     @property
@@ -181,7 +190,7 @@ class BackgroundGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.plugin._ensure_runtime = ensure_runtime
         self.deliveries = 0
 
-        async def deliver(_event, _image, lease):
+        async def deliver(_event, _image, lease, *_args, **_kwargs):
             self.deliveries += 1
             await lease.commit()
 
@@ -214,7 +223,9 @@ class BackgroundGenerationTests(unittest.IsolatedAsyncioTestCase):
             self.plugin.canvasforge_text_to_image(event, "draw a lighthouse"),
             timeout=0.3,
         )
-        self.assertIn("已受理", accepted)
+        self.assertIn("accepted=true", accepted)
+        self.assertIn("completed=false", accepted)
+        self.assertFalse(event.sent)
         await asyncio.wait_for(self.provider.started.wait(), timeout=0.3)
 
         # The provider remains blocked while this heartbeat and the duplicate
@@ -264,8 +275,12 @@ class BackgroundGenerationTests(unittest.IsolatedAsyncioTestCase):
             "safe late failure",
         )
         event = FakeEvent()
-        accepted = await self.plugin.canvasforge_text_to_image(event, "first")
-        self.assertIn("已受理", accepted)
+        accepted = await self.plugin.canvasforge_text_to_image(
+            event,
+            "first",
+            completion_message="不应发送的完成语",
+        )
+        self.assertIn("accepted=true", accepted)
         await self.provider.started.wait()
         self.provider.release.set()
         await wait_until_idle(self.plugin)
@@ -274,18 +289,21 @@ class BackgroundGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any("safe late failure" in text for text in event.sent_text),
         )
+        self.assertFalse(
+            any("不应发送的完成语" in text for text in event.sent_text),
+        )
 
         # A failed request did not create cooldown and the task slot is usable.
         self.provider = SlowProvider()
         self.factory.provider = self.provider
         retry = await self.plugin.canvasforge_text_to_image(event, "retry")
-        self.assertIn("已受理", retry)
+        self.assertIn("accepted=true", retry)
 
     async def test_successful_delivery_commits_cooldown(self) -> None:
         self.config["advanced"]["cooldown_seconds"] = 300
         event = FakeEvent()
         accepted = await self.plugin.canvasforge_text_to_image(event, "first")
-        self.assertIn("已受理", accepted)
+        self.assertIn("accepted=true", accepted)
         await self.provider.started.wait()
         self.provider.release.set()
         await wait_until_idle(self.plugin)
@@ -296,22 +314,29 @@ class BackgroundGenerationTests(unittest.IsolatedAsyncioTestCase):
     async def test_delivery_failure_does_not_commit_cooldown(self) -> None:
         self.config["advanced"]["cooldown_seconds"] = 300
 
-        async def fail_delivery(_event, _image, _lease):
+        async def fail_delivery(_event, _image, _lease, *_args, **_kwargs):
             raise main.CanvasForgeError(main.ErrorCode.SEND_FAILED)
 
         self.plugin._send_generated_image_and_commit = fail_delivery
         event = FakeEvent()
-        accepted = await self.plugin.canvasforge_text_to_image(event, "first")
-        self.assertIn("已受理", accepted)
+        accepted = await self.plugin.canvasforge_text_to_image(
+            event,
+            "first",
+            completion_message="不应发送的完成语",
+        )
+        self.assertIn("accepted=true", accepted)
         await self.provider.started.wait()
         self.provider.release.set()
         await wait_until_idle(self.plugin)
         self.assertTrue(any("send_failed" in text for text in event.sent_text))
+        self.assertFalse(
+            any("不应发送的完成语" in text for text in event.sent_text),
+        )
 
         self.provider = SlowProvider()
         self.factory.provider = self.provider
         retry = await self.plugin.canvasforge_text_to_image(event, "retry")
-        self.assertIn("已受理", retry)
+        self.assertIn("accepted=true", retry)
 
     async def test_command_acceptance_send_failure_releases_lease(self) -> None:
         failed_event = FakeEvent(
@@ -326,7 +351,7 @@ class BackgroundGenerationTests(unittest.IsolatedAsyncioTestCase):
             FakeEvent(),
             "retry",
         )
-        self.assertIn("已受理", retry)
+        self.assertIn("accepted=true", retry)
 
     async def test_task_creation_failure_releases_lease(self) -> None:
         real_create_task = asyncio.create_task
@@ -351,7 +376,7 @@ class BackgroundGenerationTests(unittest.IsolatedAsyncioTestCase):
             FakeEvent(),
             "cancel immediately",
         )
-        self.assertIn("已受理", accepted)
+        self.assertIn("accepted=true", accepted)
         task = next(iter(self.plugin._generation_tasks))
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -386,12 +411,142 @@ class BackgroundGenerationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await job.lease.release()
 
-    async def test_terminate_cancels_jobs_before_closing_session(self) -> None:
-        accepted = await self.plugin.canvasforge_text_to_image(
-            FakeEvent(),
-            "long request",
+    async def test_missing_completion_message_uses_safe_fallback(self) -> None:
+        self.plugin._send_generated_image_and_commit = (
+            main.CanvasForgePlugin._send_generated_image_and_commit.__get__(
+                self.plugin,
+            )
         )
-        self.assertIn("已受理", accepted)
+        event = FakeEvent()
+
+        accepted = await self.plugin.canvasforge_text_to_image(
+            event,
+            "draw a fallback test",
+        )
+        self.assertIn("accepted=true", accepted)
+        self.assertIn("completed=false", accepted)
+        await self.provider.started.wait()
+        self.provider.release.set()
+        await wait_until_idle(self.plugin)
+
+        self.assertEqual(2, len(event.sent))
+        self.assertIsInstance(event.sent[0].chain[0], main.Comp.Image)
+        self.assertIsInstance(event.sent[1].chain[0], main.Comp.Plain)
+        self.assertEqual("图片画好啦～", event.sent[1].chain[0].text)
+
+    async def test_success_sends_image_then_normalized_completion_message(
+        self,
+    ) -> None:
+        self.config["advanced"]["cooldown_seconds"] = 300
+        self.plugin._send_generated_image_and_commit = (
+            main.CanvasForgePlugin._send_generated_image_and_commit.__get__(
+                self.plugin,
+            )
+        )
+        event = FakeEvent()
+
+        accepted = await self.plugin.canvasforge_text_to_image(
+            event,
+            "draw an ordered delivery test",
+            completion_message="  完成啦\n请查收  " + ("呀" * 100),
+        )
+        self.assertIn("completed=false", accepted)
+        await self.provider.started.wait()
+        self.provider.release.set()
+        await wait_until_idle(self.plugin)
+
+        self.assertEqual(2, len(event.sent))
+        self.assertIsInstance(event.sent[0].chain[0], main.Comp.Image)
+        self.assertIsInstance(event.sent[1].chain[0], main.Comp.Plain)
+        completion_text = event.sent[1].chain[0].text
+        self.assertNotIn("\n", completion_text)
+        self.assertEqual(80, len(completion_text))
+        self.assertIn("完成啦", completion_text)
+        self.assertIn("请查收", completion_text)
+
+        retry = await self.plugin.canvasforge_text_to_image(
+            event,
+            "retry",
+            completion_message="不会发送",
+        )
+        self.assertIn("cooldown", retry)
+
+    async def test_image_send_failure_has_no_completion_or_cooldown(
+        self,
+    ) -> None:
+        self.config["advanced"]["cooldown_seconds"] = 300
+        self.plugin._send_generated_image_and_commit = (
+            main.CanvasForgePlugin._send_generated_image_and_commit.__get__(
+                self.plugin,
+            )
+        )
+        event = FakeEvent(image_send_fails=True)
+
+        accepted = await self.plugin.canvasforge_text_to_image(
+            event,
+            "draw a failed delivery test",
+            completion_message="不应发送的完成语",
+        )
+        self.assertIn("completed=false", accepted)
+        await self.provider.started.wait()
+        self.provider.release.set()
+        await wait_until_idle(self.plugin)
+
+        self.assertTrue(any("send_failed" in text for text in event.sent_text))
+        self.assertFalse(
+            any("不应发送的完成语" in text for text in event.sent_text),
+        )
+
+        self.provider = SlowProvider()
+        self.factory.provider = self.provider
+        retry = await self.plugin.canvasforge_text_to_image(
+            FakeEvent(),
+            "retry after failed image delivery",
+            completion_message="稍后完成",
+        )
+        self.assertIn("accepted=true", retry)
+
+    async def test_completion_send_failure_keeps_success_and_cooldown(
+        self,
+    ) -> None:
+        self.config["advanced"]["cooldown_seconds"] = 300
+        self.plugin._send_generated_image_and_commit = (
+            main.CanvasForgePlugin._send_generated_image_and_commit.__get__(
+                self.plugin,
+            )
+        )
+        event = FakeEvent(plain_send_fails=True)
+
+        accepted = await self.plugin.canvasforge_text_to_image(
+            event,
+            "draw a completion failure test",
+            completion_message="这个完成语会发送失败",
+        )
+        self.assertIn("completed=false", accepted)
+        await self.provider.started.wait()
+        self.provider.release.set()
+        await wait_until_idle(self.plugin)
+
+        self.assertEqual(1, len(event.sent))
+        self.assertIsInstance(event.sent[0].chain[0], main.Comp.Image)
+        self.assertFalse(
+            any("生图失败" in text for text in event.sent_text),
+        )
+        retry = await self.plugin.canvasforge_text_to_image(
+            event,
+            "retry after completion failure",
+            completion_message="不会发送",
+        )
+        self.assertIn("cooldown", retry)
+
+    async def test_terminate_cancels_jobs_before_closing_session(self) -> None:
+        event = FakeEvent()
+        accepted = await self.plugin.canvasforge_text_to_image(
+            event,
+            "long request",
+            completion_message="取消时不应发送的完成语",
+        )
+        self.assertIn("accepted=true", accepted)
         await self.provider.started.wait()
         session = FakeSession(self.provider)
         self.plugin._session = session
@@ -404,6 +559,9 @@ class BackgroundGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.plugin._generation_tasks)
         self.assertFalse(await self.plugin._request_gate.is_busy())
         self.assertFalse(self.plugin._web_api._active)
+        self.assertFalse(
+            any("取消时不应发送的完成语" in text for text in event.sent_text),
+        )
 
 
 if __name__ == "__main__":
