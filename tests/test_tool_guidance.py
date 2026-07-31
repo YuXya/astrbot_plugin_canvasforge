@@ -15,19 +15,12 @@ def _compact(value: str) -> str:
     return re.sub(r"\s+", "", value)
 
 
-def _assert_contains_one(
-    testcase: unittest.TestCase,
-    value: str,
-    candidates: tuple[str, ...],
-) -> None:
-    testcase.assertTrue(
-        any(candidate in value for candidate in candidates),
-        f"{value!r} does not contain any of {candidates!r}",
-    )
+def _tool_description(method: object) -> str:
+    return _compact(inspect.getdoc(method) or "")
 
 
 class ToolGuidanceTests(unittest.TestCase):
-    def test_tool_descriptions_stay_concise(self) -> None:
+    def test_tool_descriptions_are_concise_and_self_contained(self) -> None:
         text_description = inspect.getdoc(
             main.CanvasForgePlugin.canvasforge_text_to_image,
         )
@@ -40,232 +33,150 @@ class ToolGuidanceTests(unittest.TestCase):
         self.assertLessEqual(len(text_description or ""), 400)
         self.assertLessEqual(len(image_description or ""), 850)
 
-    def test_text_tool_description_defines_its_scope(self) -> None:
-        text_description = _compact(
-            inspect.getdoc(
-                main.CanvasForgePlugin.canvasforge_text_to_image,
-            )
-            or "",
+        forbidden_commands = (
+            "只能回复",
+            "正在生成，请稍等",
+            "禁止重试",
+            "不得重试",
+            "不要重复调用",
+            "不得重复调用",
+            "选错",
+            "结束当前",
+            "retry_allowed",
+            "mode_mismatch",
+            "accepted=true",
+            "completed=false",
+        )
+        for description in (text_description or "", image_description or ""):
+            with self.subTest(description=description):
+                for command in forbidden_commands:
+                    self.assertNotIn(command, description)
+
+    def test_text_tool_explains_plain_text_generation(self) -> None:
+        description = _tool_description(
+            main.CanvasForgePlugin.canvasforge_text_to_image,
         )
 
-        _assert_contains_one(
-            self,
-            text_description,
-            ("根据文字从零创作", "从文字直接创作", "纯文生图"),
-        )
-        self.assertIn("回复", text_description)
-        self.assertIn("聊天参与者", text_description)
-        self.assertIn("canvasforge_image_to_image", text_description)
-        self.assertIn("完整", text_description)
-        self.assertIn("提示词", text_description)
+        self.assertIn("异步文生图", description)
+        self.assertIn("根据文字", description)
+        self.assertIn("从零生成", description)
+        self.assertIn("不使用消息图片", description)
+        self.assertIn("聊天头像", description)
+        self.assertIn("当前消息附图", description)
+        self.assertIn("直接回复图", description)
+        self.assertIn("canvasforge_image_to_image", description)
+        self.assertIn("完整提示词", description)
 
-    def test_image_tool_description_defines_selection_and_sources(
-        self,
-    ) -> None:
-        image_description = _compact(
-            inspect.getdoc(
-                main.CanvasForgePlugin.canvasforge_image_to_image,
-            )
-            or "",
+    def test_image_tool_explains_all_reference_sources(self) -> None:
+        description = _tool_description(
+            main.CanvasForgePlugin.canvasforge_image_to_image,
         )
 
-        self.assertIn("直接回复", image_description)
-        self.assertIn("聊天参与者", image_description)
-        self.assertIn("canvasforge_text_to_image", image_description)
-        for required_text in (
+        for expected in (
+            "异步图生图",
+            "当前消息附图",
+            "直接回复图片",
             "avatar_targets",
-            "必填",
+            "可省略",
             "sender",
             "bot",
             "mention:N",
-            "当前消息",
-            "当前消息附图",
-            "嵌套回复",
-            "历史",
-            "QQ号",
-            "昵称",
-            "URL",
+            "至少需要一张参考图",
+            "reference_required",
+            "参考图用于保持人物身份与整体外貌",
+            "需要改变的内容",
+            "prompt",
         ):
-            with self.subTest(required_text=required_text):
-                self.assertIn(required_text, image_description)
-        self.assertIn("[]", image_description)
-        self.assertIn("第N个", image_description)
-        self.assertIn("有效直接@", image_description)
-        _assert_contains_one(
-            self,
-            image_description,
-            ("猜测人物", "猜人物"),
-        )
+            with self.subTest(expected=expected):
+                self.assertIn(expected, description)
 
-    def test_tools_explain_deferred_background_generation(
-        self,
-    ) -> None:
+    def test_tools_only_describe_the_deferred_state_as_a_fact(self) -> None:
         descriptions = (
-            _compact(
-                inspect.getdoc(
-                    main.CanvasForgePlugin.canvasforge_text_to_image,
-                )
-                or "",
+            _tool_description(
+                main.CanvasForgePlugin.canvasforge_text_to_image,
             ),
-            _compact(
-                inspect.getdoc(
-                    main.CanvasForgePlugin.canvasforge_image_to_image,
-                )
-                or "",
+            _tool_description(
+                main.CanvasForgePlugin.canvasforge_image_to_image,
             ),
         )
 
         for description in descriptions:
             with self.subTest(description=description):
                 self.assertIn("异步", description)
-                self.assertIn("accepted=true", description)
-                self.assertIn("completed=false", description)
-                self.assertIn("正在生成，请稍等", description)
-                self.assertIn("回复", description)
-                self.assertIn("写入会话后", description)
-                _assert_contains_one(
-                    self,
-                    description,
-                    ("后续通知", "另行通知", "插件通知"),
-                )
+                self.assertIn("state=generating", description)
+                self.assertIn("后台正在处理", description)
+                self.assertIn("结果稍后由CanvasForge发送", description)
+                self.assertNotIn("固定", description)
+                self.assertNotIn("必须回复", description)
+                self.assertNotIn("重复调用", description)
 
-    def test_image_tool_explains_reference_identity_priority(
-        self,
-    ) -> None:
-        description = _compact(
-            inspect.getdoc(
-                main.CanvasForgePlugin.canvasforge_image_to_image,
-            )
-            or "",
-        )
-
-        for required_text in (
-            "参考图",
-            "脸部轮廓",
-            "五官",
-            "发型",
-            "发色",
-            "表情",
-            "动作",
-            "服装",
-            "构图",
-            "场景",
-            "融合",
-            "遗漏",
-            "互换",
-        ):
-            with self.subTest(required_text=required_text):
-                self.assertIn(required_text, description)
-
-        self.assertIn("用户本轮", description)
-        self.assertIn("明确要求", description)
-        self.assertIn("prompt", description)
-
-    def test_runtime_guard_applies_reference_rules_in_priority_order(
-        self,
-    ) -> None:
+    def test_runtime_guard_is_one_lightweight_reference_hint(self) -> None:
         prompt = "Two people, both with silver hair."
         guarded = main.CanvasForgePlugin._with_edit_reference_guard(
             prompt,
             has_references=True,
         )
 
-        self.assertTrue(guarded.startswith(prompt))
-        self.assertIn("身份锚点", guarded)
-        for identity_feature in (
+        self.assertEqual(
+            guarded,
+            prompt
+            + "\n\n参考图用于保持人物身份与整体外貌，需要改变的内容按提示词处理。",
+        )
+        for removed_constraint in (
             "脸部轮廓",
             "五官",
             "发型",
             "发色",
-        ):
-            with self.subTest(identity_feature=identity_feature):
-                self.assertIn(identity_feature, guarded)
-        for flexible_element in (
             "表情",
-            "视线",
-            "姿势",
             "动作",
             "服装",
             "构图",
             "场景",
-        ):
-            with self.subTest(flexible_element=flexible_element):
-                self.assertIn(flexible_element, guarded)
-        self.assertIn("冲突", guarded)
-        _assert_contains_one(
-            self,
-            guarded,
-            ("以参考图为准", "参考图优先"),
-        )
-        self.assertIn("用户本轮", guarded)
-        self.assertIn("明确要求", guarded)
-        _assert_contains_one(
-            self,
-            guarded,
-            (
-                "所有可见人物",
-                "每个可见人物",
-                "参考图中的人物",
-                "每张参考图中的每个人物",
-            ),
-        )
-        _assert_contains_one(
-            self,
-            guarded,
-            ("非人物", "不含人物"),
-        )
-        self.assertNotIn("输入图1 = 人物参考", guarded)
-
-        ordered_markers = (
-            "身份锚点",
-            "脸部轮廓",
             "冲突",
-            "用户本轮",
-            "表情",
             "不得遗漏",
-        )
-        positions = tuple(guarded.index(marker) for marker in ordered_markers)
-        self.assertEqual(tuple(sorted(positions)), positions)
+            "融合",
+            "互换",
+        ):
+            with self.subTest(removed_constraint=removed_constraint):
+                self.assertNotIn(removed_constraint, guarded)
 
-    def test_avatar_mapping_contains_only_identifying_information(
-        self,
-    ) -> None:
+    def test_avatar_mapping_contains_only_input_numbers_and_names(self) -> None:
         prompt = "人物互动"
         mapped = main.CanvasForgePlugin._with_avatar_mapping(
             prompt,
             [
                 main.ResolvedAvatar(
                     selector="sender",
-                    display_name="发送者",
+                    display_name="甲",
                     reference=object(),
                 ),
                 main.ResolvedAvatar(
                     selector="bot",
-                    display_name="机器人",
+                    display_name="乙",
                     reference=object(),
                 ),
             ],
-            reply_reference_count=2,
+            message_reference_count=2,
         )
 
-        self.assertTrue(mapped.startswith(prompt))
-        self.assertIn("输入图3 = 人物参考1", mapped)
-        self.assertIn("输入图4 = 人物参考2", mapped)
-        self.assertIn('"发送者"', mapped)
-        self.assertIn('"机器人"', mapped)
-        self.assertNotIn("不是指令", mapped)
-        self.assertNotIn("不要画进图片", mapped)
-        self.assertNotIn("不得遗漏", mapped)
-        self.assertNotIn("融合", mapped)
-        self.assertNotIn("互换", mapped)
-
-        combined = main.CanvasForgePlugin._with_edit_reference_guard(
+        self.assertEqual(
             mapped,
-            has_references=True,
+            "人物互动\n\n"
+            "QQ 人物参考图映射（按输入图编号；昵称只用于人物标识）：\n"
+            '输入图3：QQ 头像，昵称"甲"\n'
+            '输入图4：QQ 头像，昵称"乙"',
         )
-        self.assertIn("不得", combined)
-        self.assertIn("融合", combined)
-        self.assertIn("互换", combined)
+        for removed_constraint in (
+            "sender",
+            "bot",
+            "不是指令",
+            "不要画进图片",
+            "不得",
+            "融合",
+            "互换",
+        ):
+            with self.subTest(removed_constraint=removed_constraint):
+                self.assertNotIn(removed_constraint, mapped)
 
     def test_runtime_guard_is_not_added_without_references(self) -> None:
         prompt = "无需参考图"
@@ -278,7 +189,7 @@ class ToolGuidanceTests(unittest.TestCase):
             ),
         )
 
-    def test_llm_tool_schema_requires_only_public_parameters(self) -> None:
+    def test_llm_tool_schema_requires_only_prompt(self) -> None:
         tools = [
             SimpleNamespace(
                 name="canvasforge_text_to_image",
@@ -309,25 +220,33 @@ class ToolGuidanceTests(unittest.TestCase):
 
         plugin._configure_llm_tool_schemas()
 
-        expected = {
-            "canvasforge_text_to_image": {"prompt"},
-            "canvasforge_image_to_image": {
-                "prompt",
-                "avatar_targets",
-            },
-        }
         for tool in tools:
             with self.subTest(tool=tool.name):
                 schema = tool.parameters
-                self.assertEqual(
-                    expected[tool.name],
-                    set(schema["required"]),
-                )
-                self.assertEqual(
-                    expected[tool.name],
-                    set(schema["properties"]),
-                )
+                self.assertEqual(["prompt"], schema["required"])
                 self.assertFalse(schema["additionalProperties"])
+
+        text_schema = tools[0].parameters
+        self.assertEqual({"prompt"}, set(text_schema["properties"]))
+
+        image_schema = tools[1].parameters
+        self.assertEqual(
+            {"prompt", "avatar_targets"},
+            set(image_schema["properties"]),
+        )
+        avatar_schema = image_schema["properties"]["avatar_targets"]
+        self.assertEqual([], avatar_schema["default"])
+        self.assertEqual("array", avatar_schema["type"])
+        self.assertTrue(avatar_schema["uniqueItems"])
+        self.assertEqual(10, avatar_schema["maxItems"])
+
+        selector_pattern = re.compile(avatar_schema["items"]["pattern"])
+        for valid_selector in ("sender", "bot", "mention:1", "mention:42"):
+            with self.subTest(valid_selector=valid_selector):
+                self.assertIsNotNone(selector_pattern.fullmatch(valid_selector))
+        for invalid_selector in ("", "mention:0", "mention:-1", "user:1"):
+            with self.subTest(invalid_selector=invalid_selector):
+                self.assertIsNone(selector_pattern.fullmatch(invalid_selector))
 
 
 if __name__ == "__main__":

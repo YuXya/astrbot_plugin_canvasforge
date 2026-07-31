@@ -68,11 +68,13 @@ class _Event:
         messages: list[Any],
         *,
         raw_message: dict[str, Any] | None = None,
+        message_id: int | str | None = None,
     ) -> None:
         self.messages = messages
         self.message_obj = SimpleNamespace(
             message=messages,
             raw_message=raw_message or {"message": []},
+            message_id=message_id,
         )
 
     def get_messages(self) -> list[Any]:
@@ -108,6 +110,217 @@ class _RejectedHttpSession:
 
 
 class ReferenceSnapshotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_snapshot_all_orders_current_images_before_reply_images(
+        self,
+    ) -> None:
+        current_first = "https://example.test/current-1.png"
+        current_second = "https://example.test/current-2.png"
+        replied = "https://example.test/replied.png"
+        resolver = ReferenceResolver(_Context(_Client({})), object())
+        event = _Event(
+            [
+                FakeReply([FakeImage(url=replied)], id=20),
+                FakeImage(url=current_first),
+                FakePlain("edit these"),
+                FakeImage(url=current_second),
+            ],
+            message_id=10,
+        )
+
+        snapshot = await resolver.snapshot_all(event)
+
+        self.assertEqual(
+            snapshot.sources,
+            (current_first, current_second, replied),
+        )
+        self.assertEqual(snapshot.current_message_id, 10)
+        self.assertEqual(snapshot.reply_message_id, 20)
+        self.assertEqual(snapshot.current_image_count, 2)
+        self.assertEqual(snapshot.reply_image_count, 1)
+        self.assertTrue(snapshot.deduplicated)
+
+    async def test_snapshot_all_stably_deduplicates_mixed_sources(self) -> None:
+        shared = "https://example.test/shared.png"
+        current_only = "https://example.test/current.png"
+        reply_only = "https://example.test/reply.png"
+        resolver = ReferenceResolver(_Context(_Client({})), object())
+        event = _Event(
+            [
+                FakeImage(url=shared),
+                FakeImage(url=shared),
+                FakeImage(url=current_only),
+                FakeReply(
+                    [
+                        FakeImage(url=shared),
+                        FakeImage(url=reply_only),
+                        FakeImage(url=reply_only),
+                    ],
+                    id=22,
+                ),
+            ],
+            message_id=11,
+        )
+
+        snapshot = await resolver.snapshot_all(event)
+
+        self.assertEqual(
+            snapshot.sources,
+            (shared, current_only, reply_only),
+        )
+        self.assertEqual(snapshot.current_image_count, 3)
+        self.assertEqual(snapshot.reply_image_count, 3)
+
+        with self.assertRaises(CanvasForgeError) as raised:
+            await resolver.resolve_snapshot(
+                snapshot,
+                max_images=2,
+                max_total_bytes=1024 * 1024,
+            )
+        self.assertEqual(raised.exception.code, ErrorCode.REFERENCE_LIMIT)
+
+    async def test_snapshot_all_reads_portable_raw_current_image(self) -> None:
+        source = _png_source()
+        resolver = ReferenceResolver(_Context(_Client({})), object())
+        event = _Event(
+            [],
+            raw_message={
+                "message_id": "73",
+                "message": [
+                    {"type": "text", "data": {"text": "edit"}},
+                    {"type": "image", "data": {"url": source}},
+                ],
+            },
+        )
+
+        snapshot = await resolver.snapshot_all(event)
+
+        self.assertEqual(snapshot.sources, (source,))
+        self.assertEqual(snapshot.current_message_id, 73)
+        self.assertEqual(snapshot.current_image_count, 1)
+
+    async def test_snapshot_all_ignores_nested_and_later_replies(self) -> None:
+        current = "https://example.test/current.png"
+        direct = "https://example.test/direct.png"
+        nested = "https://example.test/nested.png"
+        historical = "https://example.test/history.png"
+        resolver = ReferenceResolver(_Context(_Client({})), object())
+        event = _Event(
+            [
+                FakeImage(url=current),
+                FakeReply(
+                    [
+                        FakeImage(url=direct),
+                        FakeReply([FakeImage(url=nested)], id=31),
+                    ],
+                    id=30,
+                ),
+                FakeReply([FakeImage(url=historical)], id=29),
+            ],
+            message_id=32,
+        )
+
+        snapshot = await resolver.snapshot_all(event)
+
+        self.assertEqual(snapshot.sources, (current, direct))
+
+    async def test_snapshot_all_refreshes_local_current_image_by_message_id(
+        self,
+    ) -> None:
+        refreshed_source = _png_source()
+        client = _Client(
+            {
+                "data": {
+                    "message": [
+                        {
+                            "type": "image",
+                            "data": {"url": refreshed_source},
+                        },
+                    ],
+                },
+            },
+        )
+        resolver = ReferenceResolver(_Context(client), object())
+        event = _Event(
+            [FakeImage(file="/tmp/current.png")],
+            message_id="456",
+        )
+
+        snapshot = await resolver.snapshot_all(event)
+
+        self.assertEqual(snapshot.sources, (refreshed_source,))
+        self.assertTrue(snapshot.refreshed)
+        self.assertEqual(snapshot.current_message_id, 456)
+        self.assertEqual(
+            client.calls,
+            [
+                {
+                    "action": "get_msg",
+                    "message_id": 456,
+                    "self_id": 10001,
+                },
+            ],
+        )
+
+    async def test_snapshot_all_refreshes_stale_current_url_in_background(
+        self,
+    ) -> None:
+        refreshed_source = _png_source(width=6, height=7)
+        client = _Client(
+            {
+                "message": [
+                    {
+                        "type": "image",
+                        "data": {"url": refreshed_source},
+                    },
+                ],
+            },
+        )
+        resolver = ReferenceResolver(_Context(client), _RejectedHttpSession())
+        event = _Event(
+            [FakeImage(url="https://example.test/expired-current.png")],
+            message_id=654,
+        )
+        snapshot = await resolver.snapshot_all(event)
+        event.messages.clear()
+
+        references = await resolver.resolve_snapshot(
+            snapshot,
+            max_images=3,
+            max_total_bytes=1024 * 1024,
+            event=event,
+        )
+
+        self.assertEqual(len(references), 1)
+        self.assertEqual((references[0].width, references[0].height), (6, 7))
+        self.assertEqual(client.calls[0]["message_id"], 654)
+
+    async def test_snapshot_all_rejects_local_current_image_without_id(
+        self,
+    ) -> None:
+        resolver = ReferenceResolver(_Context(_Client({})), object())
+        event = _Event([FakeImage(file="C:\\private\\current.png")])
+
+        with self.assertRaises(CanvasForgeError) as raised:
+            await resolver.snapshot_all(event)
+
+        self.assertEqual(raised.exception.code, ErrorCode.REFERENCE_INVALID)
+
+    async def test_legacy_snapshot_still_ignores_current_images(self) -> None:
+        current = "https://example.test/current.png"
+        replied = "https://example.test/replied.png"
+        resolver = ReferenceResolver(_Context(_Client({})), object())
+        event = _Event(
+            [
+                FakeImage(url=current),
+                FakeReply([FakeImage(url=replied)], id=42),
+            ],
+            message_id=41,
+        )
+
+        snapshot = await resolver.snapshot(event)
+
+        self.assertEqual(snapshot.sources, (replied,))
+
     async def test_snapshot_copies_portable_sources_without_refresh(self) -> None:
         client = _Client({})
         resolver = ReferenceResolver(_Context(client), object())

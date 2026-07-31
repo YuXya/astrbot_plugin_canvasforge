@@ -62,17 +62,22 @@ class _ImageSource:
 
 @dataclass(frozen=True, slots=True)
 class ReferenceSnapshot:
-    """Portable direct-reply image sources captured before background work.
+    """Portable image sources captured before background work.
 
     The snapshot deliberately retains neither the AstrBot event nor a local
-    filesystem path. Source values are limited by ``snapshot()`` to HTTP(S),
-    inline Base64, or data URIs, so a worker can resolve them after the
-    initiating event has finished.
+    filesystem path. Source values are limited to HTTP(S), inline Base64, or
+    data URIs, so a worker can resolve them after the initiating event has
+    finished. Origin metadata is retained only so a stale portable URL can be
+    refreshed through OneBot while resolving in the background.
     """
 
     sources: tuple[str, ...] = field(repr=False)
     refreshed: bool = False
     reply_message_id: int | str | None = field(default=None, repr=False)
+    current_message_id: int | str | None = field(default=None, repr=False)
+    current_image_count: int = field(default=0, repr=False)
+    reply_image_count: int = field(default=0, repr=False)
+    deduplicated: bool = field(default=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.sources, tuple):
@@ -82,10 +87,12 @@ class ReferenceSnapshot:
             for source in self.sources
         ):
             raise ValueError("reference snapshot sources must be non-empty strings")
+        if self.current_image_count < 0 or self.reply_image_count < 0:
+            raise ValueError("reference snapshot image counts cannot be negative")
 
     @property
     def count(self) -> int:
-        """Number of direct reply images captured in this snapshot."""
+        """Number of portable images in this snapshot."""
 
         return len(self.sources)
 
@@ -99,11 +106,13 @@ class _InspectedImage:
 
 
 class ReferenceResolver:
-    """Resolve the direct images in the first reply component.
+    """Resolve portable images from the current message and its direct reply.
 
-    The current message's top-level images and nested replies are deliberately
-    ignored. Network and inline sources are decoded in memory; filesystem
-    sources are never opened.
+    ``snapshot()`` retains its legacy first-direct-reply-only behavior.
+    ``snapshot_all()`` adds the current message's top-level images ahead of
+    those reply images. Nested replies and history are deliberately ignored.
+    Network and inline sources are decoded in memory; filesystem sources are
+    never opened.
     """
 
     def __init__(self, context: Any, session: aiohttp.ClientSession) -> None:
@@ -142,6 +151,7 @@ class ReferenceResolver:
                         initial_sources,
                         refreshed=False,
                         reply_message_id=reply_message_id,
+                        reply_image_count=len(initial_sources),
                     )
                 expected_count = len(direct_images)
             refresh_target: Any = reply
@@ -167,6 +177,29 @@ class ReferenceResolver:
             refreshed,
             refreshed=True,
             reply_message_id=reply_message_id,
+            reply_image_count=len(refreshed),
+        )
+
+    async def snapshot_all(self, event: AstrMessageEvent) -> ReferenceSnapshot:
+        """Capture current-message images, then first-direct-reply images.
+
+        Only top-level ``Image`` components from the current message and
+        direct ``Image`` children of the first ``Reply`` are considered. The
+        resulting portable sources are stably deduplicated and retain enough
+        message metadata for a background worker to refresh expired URLs.
+        """
+
+        current = await self._snapshot_current_message(event)
+        reply = await self.snapshot(event)
+        combined = self._deduplicate_sources((*current.sources, *reply.sources))
+        return ReferenceSnapshot(
+            sources=combined,
+            refreshed=current.refreshed or reply.refreshed,
+            reply_message_id=reply.reply_message_id,
+            current_message_id=current.current_message_id,
+            current_image_count=current.current_image_count,
+            reply_image_count=reply.reply_image_count,
+            deduplicated=True,
         )
 
     async def has_direct_images(self, event: AstrMessageEvent) -> bool:
@@ -209,13 +242,13 @@ class ReferenceResolver:
                 max_edge=max_edge,
             )
         except _RefreshableReferenceProblem as exc:
-            if event is None or snapshot.reply_message_id is None:
+            if event is None or not self._snapshot_can_refresh(snapshot):
                 raise CanvasForgeError(
                     ErrorCode.REFERENCE_INVALID,
                     str(exc),
                 ) from None
             logger.info(
-                "CanvasForge will refresh a snapshotted quoted image batch "
+                "CanvasForge will refresh a snapshotted image batch "
                 "after a validation failure (%s).",
                 type(exc).__name__,
             )
@@ -231,19 +264,14 @@ class ReferenceResolver:
             ) from None
 
         try:
-            refreshed = await self._refresh_sources(
-                event,
-                snapshot.reply_message_id,
-            )
+            refreshed = await self._refresh_snapshot_sources(event, snapshot)
         except _RefreshProblem as exc:
             logger.warning(
-                "CanvasForge could not refresh a snapshotted quoted image "
+                "CanvasForge could not refresh a snapshotted image "
                 "batch (%s).",
                 type(exc).__name__,
             )
             raise self._invalid_reference_error() from None
-        if len(refreshed) != snapshot.count:
-            raise self._invalid_reference_error()
         return await self._resolve_refreshed(
             refreshed,
             max_images=max_images,
@@ -341,6 +369,10 @@ class ReferenceResolver:
         *,
         refreshed: bool,
         reply_message_id: int | str | None = None,
+        current_message_id: int | str | None = None,
+        current_image_count: int = 0,
+        reply_image_count: int = 0,
+        deduplicated: bool = False,
     ) -> ReferenceSnapshot:
         portable_sources: list[str] = []
         for descriptor in sources:
@@ -348,11 +380,122 @@ class ReferenceResolver:
             if source is None:
                 raise cls._invalid_reference_error()
             portable_sources.append(source)
+        if deduplicated:
+            snapshot_sources = cls._deduplicate_sources(portable_sources)
+        else:
+            snapshot_sources = tuple(portable_sources)
         return ReferenceSnapshot(
-            sources=tuple(portable_sources),
+            sources=snapshot_sources,
             refreshed=refreshed,
             reply_message_id=reply_message_id,
+            current_message_id=current_message_id,
+            current_image_count=current_image_count,
+            reply_image_count=reply_image_count,
+            deduplicated=deduplicated,
         )
+
+    async def _snapshot_current_message(
+        self,
+        event: AstrMessageEvent,
+    ) -> ReferenceSnapshot:
+        """Capture only top-level images attached to the current message."""
+
+        current_message_id = self._current_message_id(event)
+        direct_images = [
+            component
+            for component in self._event_messages(event)
+            if isinstance(component, Image)
+        ]
+        initial_sources = [
+            _ImageSource(self._component_source(image))
+            for image in direct_images
+        ]
+
+        if not initial_sources:
+            initial_sources = self._sources_from_onebot_message(
+                self._raw_message_chain(event),
+            )
+        if not initial_sources:
+            return ReferenceSnapshot(())
+
+        if all(item.source is not None for item in initial_sources):
+            return self._snapshot_from_sources(
+                initial_sources,
+                refreshed=False,
+                current_message_id=current_message_id,
+                current_image_count=len(initial_sources),
+            )
+
+        if current_message_id is None:
+            raise self._invalid_reference_error()
+        try:
+            refreshed = await self._refresh_sources(event, current_message_id)
+        except _RefreshProblem as exc:
+            logger.warning(
+                "CanvasForge could not snapshot current-message images (%s).",
+                type(exc).__name__,
+            )
+            raise self._invalid_reference_error() from None
+        if len(refreshed) != len(initial_sources):
+            raise self._invalid_reference_error()
+        return self._snapshot_from_sources(
+            refreshed,
+            refreshed=True,
+            current_message_id=current_message_id,
+            current_image_count=len(refreshed),
+        )
+
+    async def _refresh_snapshot_sources(
+        self,
+        event: AstrMessageEvent,
+        snapshot: ReferenceSnapshot,
+    ) -> list[_ImageSource]:
+        """Refresh every recorded origin without expanding its boundaries."""
+
+        refreshed: list[_ImageSource] = []
+
+        if snapshot.current_image_count:
+            if snapshot.current_message_id is None:
+                raise _RefreshProblem("missing current message id")
+            current = await self._refresh_sources(
+                event,
+                snapshot.current_message_id,
+            )
+            if len(current) != snapshot.current_image_count:
+                raise _RefreshProblem("current image count changed")
+            refreshed.extend(current)
+
+        if snapshot.reply_image_count:
+            if snapshot.reply_message_id is None:
+                raise _RefreshProblem("missing reply message id")
+            reply = await self._refresh_sources(
+                event,
+                snapshot.reply_message_id,
+            )
+            if len(reply) != snapshot.reply_image_count:
+                raise _RefreshProblem("reply image count changed")
+            refreshed.extend(reply)
+        elif (
+            not snapshot.current_image_count
+            and snapshot.reply_message_id is not None
+        ):
+            # Backward compatibility for snapshots created before origin counts
+            # were recorded.
+            reply = await self._refresh_sources(event, snapshot.reply_message_id)
+            if len(reply) != snapshot.count:
+                raise _RefreshProblem("reply image count changed")
+            refreshed.extend(reply)
+
+        if snapshot.deduplicated:
+            portable = self._snapshot_from_sources(
+                refreshed,
+                refreshed=True,
+                deduplicated=True,
+            )
+            refreshed = [_ImageSource(source) for source in portable.sources]
+        if len(refreshed) != snapshot.count:
+            raise _RefreshProblem("reference image count changed")
+        return refreshed
 
     async def _resolve_refreshed(
         self,
@@ -568,26 +711,7 @@ class ReferenceResolver:
         if not message:
             raise _RefreshProblem("empty get_msg response")
 
-        sources: list[_ImageSource] = []
-        for segment in message:
-            if not isinstance(segment, Mapping):
-                continue
-            if str(segment.get("type", "")).lower() != "image":
-                continue
-            data = segment.get("data")
-            if not isinstance(data, Mapping):
-                sources.append(_ImageSource(None))
-                continue
-            sources.append(
-                _ImageSource(
-                    self._first_allowed_source(
-                        data.get("url"),
-                        data.get("file"),
-                        data.get("path"),
-                    ),
-                ),
-            )
-        return sources
+        return self._sources_from_onebot_message(message)
 
     def _client_for_event(self, event: AstrMessageEvent) -> Any:
         platform_name = self._safe_event_value(event, "get_platform_name")
@@ -629,33 +753,45 @@ class ReferenceResolver:
 
     @staticmethod
     def _first_reply(event: AstrMessageEvent) -> Reply | None:
+        return next(
+            (
+                component
+                for component in ReferenceResolver._event_messages(event)
+                if isinstance(component, Reply)
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _event_messages(event: AstrMessageEvent) -> Sequence[Any]:
         get_messages = getattr(event, "get_messages", None)
         if callable(get_messages):
             messages = get_messages()
         else:
             message_obj = getattr(event, "message_obj", None)
             messages = getattr(message_obj, "message", [])
-        if not isinstance(messages, Sequence):
-            return None
-        return next(
-            (component for component in messages if isinstance(component, Reply)),
-            None,
-        )
+        if isinstance(messages, Sequence) and not isinstance(
+            messages,
+            (str, bytes, bytearray),
+        ):
+            return messages
+        return ()
 
     @staticmethod
-    def _raw_reply_id(event: AstrMessageEvent) -> Any | None:
-        """Extract only a direct OneBot reply id from the current raw event."""
-
+    def _raw_message_chain(event: AstrMessageEvent) -> list[Any]:
         message_obj = getattr(event, "message_obj", None)
         raw_message = getattr(message_obj, "raw_message", None)
         if isinstance(raw_message, Mapping):
             raw_chain = raw_message.get("message")
         else:
             raw_chain = getattr(raw_message, "message", None)
-        if not isinstance(raw_chain, list):
-            return None
+        return raw_chain if isinstance(raw_chain, list) else []
 
-        for segment in raw_chain:
+    @staticmethod
+    def _raw_reply_id(event: AstrMessageEvent) -> Any | None:
+        """Extract only a direct OneBot reply id from the current raw event."""
+
+        for segment in ReferenceResolver._raw_message_chain(event):
             if not isinstance(segment, Mapping):
                 continue
             if str(segment.get("type", "")).lower() != "reply":
@@ -670,11 +806,87 @@ class ReferenceResolver:
         return None
 
     @classmethod
+    def _current_message_id(cls, event: AstrMessageEvent) -> int | str | None:
+        get_message_id = getattr(event, "get_message_id", None)
+        if callable(get_message_id):
+            try:
+                message_id = get_message_id()
+            except Exception:
+                message_id = None
+            if message_id not in (None, ""):
+                return cls._onebot_scalar(message_id)
+
+        message_obj = getattr(event, "message_obj", None)
+        for attribute in ("message_id", "id"):
+            message_id = getattr(message_obj, attribute, None)
+            if message_id not in (None, ""):
+                return cls._onebot_scalar(message_id)
+
+        raw_message = getattr(message_obj, "raw_message", None)
+        if isinstance(raw_message, Mapping):
+            message_id = raw_message.get("message_id")
+        else:
+            message_id = getattr(raw_message, "message_id", None)
+        if message_id not in (None, ""):
+            return cls._onebot_scalar(message_id)
+        return None
+
+    @classmethod
     def _component_source(cls, image: Image) -> str | None:
         return cls._first_allowed_source(
             getattr(image, "url", None),
             getattr(image, "file", None),
             getattr(image, "path", None),
+        )
+
+    @classmethod
+    def _sources_from_onebot_message(
+        cls,
+        message: Sequence[Any],
+    ) -> list[_ImageSource]:
+        sources: list[_ImageSource] = []
+        for segment in message:
+            if not isinstance(segment, Mapping):
+                continue
+            if str(segment.get("type", "")).lower() != "image":
+                continue
+            data = segment.get("data")
+            if not isinstance(data, Mapping):
+                sources.append(_ImageSource(None))
+                continue
+            sources.append(
+                _ImageSource(
+                    cls._first_allowed_source(
+                        data.get("url"),
+                        data.get("file"),
+                        data.get("path"),
+                    ),
+                ),
+            )
+        return sources
+
+    @staticmethod
+    def _deduplicate_sources(sources: Sequence[str]) -> tuple[str, ...]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for source in sources:
+            normalized = source.strip()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            result.append(normalized)
+        return tuple(result)
+
+    @staticmethod
+    def _snapshot_can_refresh(snapshot: ReferenceSnapshot) -> bool:
+        if snapshot.current_image_count and snapshot.current_message_id is None:
+            return False
+        if snapshot.reply_image_count and snapshot.reply_message_id is None:
+            return False
+        return bool(
+            snapshot.current_image_count
+            or snapshot.reply_image_count
+            or snapshot.reply_message_id is not None
         )
 
     @staticmethod

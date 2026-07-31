@@ -20,7 +20,7 @@ class ErrorCode(str, Enum):
     NOT_CONFIGURED = "not_configured"
     CONFIG_INVALID = "config_invalid"
     MISSING_PROMPT = "missing_prompt"
-    MODE_MISMATCH = "mode_mismatch"
+    REFERENCE_REQUIRED = "reference_required"
     BUSY = "busy"
     COOLDOWN = "cooldown"
     AUTH = "auth"
@@ -38,18 +38,15 @@ _DEFAULT_MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.REFERENCE_LIMIT: "引用图片数量超过当前限制，请减少后重试。",
     ErrorCode.REFERENCE_INVALID: "引用图片无效或已失效，请重新发送图片并引用后重试。",
     ErrorCode.AVATAR_DISABLED: "人物头像引用功能当前已由管理员关闭。",
-    ErrorCode.AVATAR_TARGET_INVALID: "人物头像选择器无效、重复或不适用于当前会话。",
+    ErrorCode.AVATAR_TARGET_INVALID: "人物头像选择器无效或不适用于当前会话。",
     ErrorCode.AVATAR_UNAVAILABLE: "人物头像暂时无法获取或图片无效，请稍后重试。",
     ErrorCode.PLATFORM_UNSUPPORTED: "CanvasForge 当前仅支持 NapCat（aiocqhttp）平台。",
     ErrorCode.ADMIN_ONLY: "CanvasForge 当前仅允许 AstrBot 管理员使用。",
     ErrorCode.NOT_CONFIGURED: "CanvasForge 尚未配置图片服务站点或 Key。",
     ErrorCode.CONFIG_INVALID: "CanvasForge 的图片服务配置无效，请联系管理员检查。",
     ErrorCode.MISSING_PROMPT: "请提供要生成或编辑的图片描述。",
-    ErrorCode.MODE_MISMATCH: "当前请求与所选生图工具不匹配，请选择正确的工具后重试。",
-    ErrorCode.BUSY: (
-        "CanvasForge 一次只能处理一个生图任务；"
-        "请等待当前任务完成后再试。"
-    ),
+    ErrorCode.REFERENCE_REQUIRED: "图生图至少需要一张参考图片。",
+    ErrorCode.BUSY: "CanvasForge 当前没有可用的生图任务位。",
     ErrorCode.COOLDOWN: "生成冷却尚未结束，请稍后再试。",
     ErrorCode.AUTH: "图片服务鉴权失败，请管理员检查站点和 Key。",
     ErrorCode.RATE_LIMIT: "图片服务当前限流，请稍后再试。",
@@ -77,10 +74,12 @@ class CanvasForgeError(Exception):
         message: str | None = None,
         *,
         retry_after: int | None = None,
+        task_id: str | None = None,
     ) -> None:
         self.code = code
         self.message = message or _DEFAULT_MESSAGES[code]
         self.retry_after = retry_after
+        self.task_id = task_id
         super().__init__(self.message)
 
     def __str__(self) -> str:

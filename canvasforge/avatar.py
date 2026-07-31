@@ -201,10 +201,7 @@ class AvatarResolver:
                 fallback_name = f"群友{ordinal}"
 
             if user_id in seen_users:
-                raise CanvasForgeError(
-                    ErrorCode.AVATAR_TARGET_INVALID,
-                    "头像人物选择包含重复身份，请只选择每个人一次。",
-                )
+                continue
             seen_users.add(user_id)
             planned.append(
                 AvatarTarget(

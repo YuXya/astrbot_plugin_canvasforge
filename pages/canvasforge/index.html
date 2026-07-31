@@ -95,6 +95,11 @@
                 <span>用户冷却（秒）</span>
                 <input id="cooldown_seconds" name="cooldown_seconds" type="number" min="0" max="86400" step="1" />
               </label>
+              <label class="field">
+                <span>全局同时生图数</span>
+                <input id="max_concurrent_generations" name="max_concurrent_generations" type="number" min="1" max="32" step="1" />
+                <small>每个会话仍最多运行一个任务；超过总上限时不排队。</small>
+              </label>
               <label class="toggle-field field-wide" for="admin_only_generation">
                 <input
                   id="admin_only_generation"
@@ -104,7 +109,7 @@
                 />
                 <span class="toggle-copy">
                   <strong>仅允许 AstrBot 管理员使用 CanvasForge</strong>
-                  <small>默认开启；同时限制两个 LLM 生图工具和 /canvasforge 命令。关闭后普通用户仍受全局单任务与用户冷却限制。</small>
+                  <small>默认开启；同时限制两个 LLM 生图工具和 /canvasforge 命令。关闭后普通用户仍受并发上限与用户冷却限制。</small>
                 </span>
               </label>
               <label class="field">

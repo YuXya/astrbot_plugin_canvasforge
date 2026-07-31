@@ -53,6 +53,11 @@
         "type": "int",
         "default": 300
       },
+      "max_concurrent_generations": {
+        "description": "全局同时生图任务上限",
+        "type": "int",
+        "default": 3
+      },
       "admin_only_generation": {
         "description": "仅允许 AstrBot 管理员使用 CanvasForge 生图功能",
         "type": "bool",

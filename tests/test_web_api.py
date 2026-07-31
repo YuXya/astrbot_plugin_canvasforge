@@ -6,7 +6,7 @@ from tests.astrbot_stubs import FakeRequest, install_astrbot_stubs
 
 install_astrbot_stubs()
 
-from canvasforge.web_api import WebAPI
+from canvasforge.web_api import ADVANCED_DEFAULTS, WebAPI, normalize_settings
 
 
 class FakeContext:
@@ -49,6 +49,24 @@ class WebAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(200, response.status_code)
         self.assertEqual("v0.1.7", response.payload["plugin_version"])
         self.assertEqual("custom-image-model", response.payload["model"])
+        self.assertEqual(3, response.payload["max_concurrent_generations"])
+
+    def test_generation_concurrency_setting_is_bounded(self) -> None:
+        self.assertEqual(3, ADVANCED_DEFAULTS["max_concurrent_generations"])
+        self.assertEqual(
+            7,
+            normalize_settings(
+                {"max_concurrent_generations": 7},
+                strict=True,
+            )["max_concurrent_generations"],
+        )
+        for invalid in (0, 33):
+            with self.subTest(value=invalid):
+                with self.assertRaises(ValueError):
+                    normalize_settings(
+                        {"max_concurrent_generations": invalid},
+                        strict=True,
+                    )
 
 
 if __name__ == "__main__":
